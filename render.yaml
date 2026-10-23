@@ -5,6 +5,7 @@ services:
     rootDir: python
     buildCommand: pip install uv && uv sync --active
     startCommand: uv run --active main.py
+    healthCheckPath: /api/status
     envVars:
       - key: PORT
         value: "8000"

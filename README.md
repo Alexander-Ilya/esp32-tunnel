@@ -34,7 +34,12 @@ WiFi + TLS (the `https` relay) + your web server, not the tunnel.
 - **Drop the local web server** — use handler mode (`tunnelSetup(SELFHOST, handler, "host/id")`); no `ESPAsyncWebServer`, saves its flash **and** its runtime `AsyncTCP` task/buffers.
 - **`#define TUN_MDNS 0`** before the include — drops mDNS (~30 KB) if you don't need `<id>.local`.
 - **`#define TUN_TASK_STACK 6144`** — trims the background-task stack (RAM). Keep ≥8 KB if your relay is `https` (TLS needs the headroom).
-- **CPU** is a non-issue — the task idles on a 10 ms poll (microsecond checks). Don't optimize it.
+- **CPU** is a non-issue — the self-hosted task sleeps in `select()` until the relay sends something.
+- **`#define TUN_MAX_BODY 32768`** — largest request/response body (default 16 KB). One body is buffered
+  in RAM, and an Arduino `String` caps at 65535 B without PSRAM, so ~64 KB is the ceiling. Bigger
+  replies get a clear `502 Response larger than TUN_MAX_BODY` instead of a truncated page.
+- **Wi-Fi modem sleep** slows replies a lot (measured: 1 KB took 11 s with sleep on, 64 ms off).
+  Call `WiFi.setSleep(false)` if latency matters more than power.
 
 ## Dependencies
 
@@ -91,7 +96,8 @@ tunnelSetup(BORE);                                 // free TCP via bore.pub
 > **ESP32:** `tunnelSetup()` starts a background FreeRTOS task, so you do **not**
 > call `tunnelLoop()`. Leave `loop()` empty, use it for your own code, or
 > `vTaskDelete(NULL)` to reclaim its stack. Enable request logs with `tunnelLog()`.
-> Tune the task with `-DTUN_TASK_CORE=0 -DTUN_TASK_PRIO=2 -DTUN_TASK_STACK=10240`.
+> Tune the task with `-DTUN_TASK_CORE=0 -DTUN_TASK_PRIO=3 -DTUN_TASK_STACK=10240`. Keep the priority
+> above `loopTask` (1): at equal priority a busy `loop()` wedged the tunnel socket (default is 2).
 >
 > **ESP8266** has no such task — there you must call `tunnelLoop()` in `loop()`.
 
@@ -112,6 +118,7 @@ All providers expose the same public API:
 | `tunnelReady()` | `true` when tunnel is live |
 | `tunnelLastIP()` | Last requester's IP address |
 | `tunnelProviderName()` | `"self-hosted"`, `"localtunnel"`, or `"bore"` |
+| `tunnelContentType(t)` | Handler mode: set this response's Content-Type (default `text/html`) |
 
 ### Self-hosted `tunnelSetup()`
 
@@ -158,12 +165,32 @@ tunnelSetup(BORE);                                   // bore.pub, random port
 tunnelSetup(BORE, "your-server.com");                // self-hosted bore server
 ```
 
+### Optional modules (handler mode)
+
+Handler mode has no web server, so these opt-in headers serve assets directly.
+In proxy mode you don't need them: ESPAsyncWebServer's `serveStatic()` / `send()` already does it.
+
+```cpp
+#include <esp32tunnel_progmem.h>   // tunnelProgmem(data, type) — PROGMEM string
+#include <esp32tunnel_littlefs.h>  // tunnelFile(path[, fs])   — file from LittleFS (or any fs::FS)
+
+const char INDEX_HTML[] PROGMEM = "<h1>Hello</h1>";
+
+String handler(const String &method, const String &path) {
+  if (path == "/")    return tunnelProgmem(INDEX_HTML, "text/html");
+  if (path == "/api") { tunnelContentType("application/json"); return "{\"ok\":1}"; }
+  return tunnelFile(path);         // "/" + "/dir/" -> index.html; "" = 404
+}
+```
+
+Text assets only (html/css/js/json/svg/txt), up to `TUN_MAX_BODY` per response.
+
 ## Providers
 
 | | Self-hosted | localtunnel | bore |
 |---|---|---|---|
 | Enum | `SELFHOST` | `LOCALTUNNEL` | `BORE` |
-| TLS on ESP32 | ❌ (plain WS) | ✅ (WiFiClientSecure) | ❌ (plain TCP) |
+| TLS on ESP32 | optional (`https://` URL) | ✅ (WiFiClientSecure) | ❌ (plain TCP) |
 | RAM usage | Low (~40 KB less) | Higher (TLS) | Low |
 | URL format | `http://host/device-id` | `https://xxx.loca.lt` | `http://bore.pub:PORT` |
 | Protocol | WebSocket relay | TCP pool | TCP tunnel |
@@ -186,9 +213,9 @@ void setup() {
 }
 ```
 
-> **Note:** The relay server must accept plain WebSocket (`ws://`) connections.
-> If your server is behind HTTPS-only (e.g. Render.com), you'll need a plain WS
-> endpoint or a proxy that terminates TLS before reaching the ESP32 connection.
+> **Note:** Prefix the server with `https://` (e.g. `"https://my-relay.onrender.com/my-device"`)
+> to connect over TLS (`wss://`). Without a scheme it uses plain `ws://` on port 80 — lighter
+> on RAM, but only for servers that accept plain WebSocket. Pin the server cert with `tunnelCACert(pem)`.
 
 ### Deploy Your Own (Render.com)
 

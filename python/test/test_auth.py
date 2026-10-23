@@ -35,9 +35,18 @@ def get(devid, key=None, where="query"):
         return e.code
 
 
+def fetch(path, data=None):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(BASE + path, data=data), timeout=10) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+
+
 async def main():
     loop = asyncio.get_running_loop()
     async def g(*a, **k): return await loop.run_in_executor(None, lambda: get(*a, **k))
+    async def f(*a): return await loop.run_in_executor(None, lambda: fetch(*a))
 
     results = []
     def ok(name, got, want): results.append((name, got, want, got == want))
@@ -64,6 +73,13 @@ async def main():
     async with FakeESP32(f"ws://127.0.0.1:8011", "pubdev", ""):
         await asyncio.sleep(0.4)
         ok("public, no key -> 200", await g("pubdev"), 200)
+
+        # ── proxy: what the device actually receives ──
+        ok("query kept, key stripped", await f("/pubdev/set?temp=20&key=x&on=1"), (200, "GET /set?temp=20&on=1"))
+        ok("encoded path kept",        await f("/pubdev/a%20b"), (200, "GET /a%20b"))
+        ok("dot-dot -> 400",           (await f("/pubdev/a/%2e%2e/b"))[0], 400)
+        ok("oversize body -> 413",     (await f("/pubdev/echo", b"x" * 20000))[0], 413)
+        ok("small POST -> 200",        await f("/pubdev/echo", b"hi"), (200, "POST /echo"))
 
     for name, got, want, good in results:
         print(f"  [{'OK' if good else 'FAIL'}] {name:24} got={got}")

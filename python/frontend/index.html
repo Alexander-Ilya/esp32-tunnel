@@ -24,7 +24,7 @@
     <div id="view-device" class="space-y-4">
       <section class="bg-zinc-900 border border-zinc-800 rounded-xl p-4 space-y-3">
         <div class="flex gap-2">
-          <input id="id" value="demo" placeholder="device id" autocapitalize="off" autocorrect="off" spellcheck="false"
+          <input id="id" placeholder="device id (from tunnelSetup)" autocapitalize="off" autocorrect="off" spellcheck="false"
             class="flex-1 min-w-0 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2.5 focus:border-orange-500 outline-none">
           <button id="refresh" class="shrink-0 px-4 py-2.5 rounded-lg border border-zinc-800 hover:border-orange-500 active:bg-zinc-800">↻</button>
         </div>
@@ -173,19 +173,23 @@
 
     async function refresh() {
       const id = $('id').value.trim();
+      try { localStorage.setItem('id', id); } catch {}
       $('dot').className = 'w-2.5 h-2.5 rounded-full bg-zinc-600';
+      if (!id) { $('state').textContent = 'enter a device id'; $('state_ms').textContent = ''; $('state_body').textContent = ''; return; }
       $('state').textContent = 'checking…'; $('state').className = 'text-sm font-medium text-zinc-400';
       $('state_ms').textContent = ''; $('state_body').textContent = '';
       const t0 = performance.now();
       try {
         const res = await fetch(`${origin}/${id}/status`, { headers: hdr() });
         const ms = Math.round(performance.now() - t0);
-        const ok = res.ok;
+        const body = await res.text();
+        // Relay errors are JSON {"detail": …}; any other reply came from the device itself.
+        const ok = res.ok || !body.startsWith('{"detail"');
         $('dot').className = 'w-2.5 h-2.5 rounded-full ' + (ok ? 'bg-green-500' : 'bg-red-500');
-        $('state').textContent = ok ? 'Online' : `Unreachable (${res.status})`;
+        $('state').textContent = ok ? (res.ok ? 'Online' : `Online (no /status: ${res.status})`) : `Unreachable (${res.status})`;
         $('state').className = 'text-sm font-medium ' + (ok ? 'text-green-400' : 'text-red-400');
         $('state_ms').textContent = ms + ' ms';
-        $('state_body').textContent = await res.text();
+        $('state_body').textContent = body;
       } catch (e) {
         $('dot').className = 'w-2.5 h-2.5 rounded-full bg-red-500';
         $('state').textContent = 'Offline'; $('state').className = 'text-sm font-medium text-red-400';
@@ -215,6 +219,7 @@
       $('send').disabled = false;
     }
 
+    try { $('id').value = localStorage.getItem('id') || ''; } catch {}
     renderViews();
     renderTabs();
     $('send').onclick = send;

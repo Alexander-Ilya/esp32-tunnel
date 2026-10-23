@@ -14,26 +14,25 @@ import pathlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.staticfiles import StaticFiles
 
-from middleware import middleware, log
+from middleware import add_middlewares, log
+from api.tunnel import tunnel_proxy
 
-_frontend = pathlib.Path(__file__).parent / "frontend"
 PORT = int(os.environ.get("PORT", 8000))
 
 
+# MARK: Startup/shutdown hook — add init/cleanup here
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info(f"Server: http://0.0.0.0:{PORT}")
+    log.info(f"Server: http://localhost:{PORT}")
     yield
 
 
 app = FastAPI(title="esp32-tunnel", lifespan=lifespan)
-middleware.add_middlewares(app)
+add_middlewares(app)
 
 
-# MARK: Auto-discover routers from api/ — drop a module with a `router` in api/
-# and it's registered, no wiring here.
+# MARK: Every api/*.py module with a `router` is mounted under /api — no wiring here.
 def _include_all_routers(directory: str, prefix: str):
     api_dir = pathlib.Path(__file__).parent / directory
     for py in sorted(api_dir.rglob("*.py")):
@@ -48,25 +47,15 @@ def _include_all_routers(directory: str, prefix: str):
 _include_all_routers("api", "/api")
 
 
-# MARK: Catch-all proxy — /{tid} and /{tid}/{path} (after specific routes)
-from api.tunnel import tunnel_proxy
-
-_ALL_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
-
-
-@app.api_route("/{tid}/{path:path}", methods=_ALL_METHODS)
-async def proxy_path(tid: str, path: str, request: Request):
-    return await tunnel_proxy(tid, path, request)
+# MARK: Catch-all proxy — /{tid} and /{tid}/... (after the /api routes)
+@app.api_route("/{tid}{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def proxy(tid: str, request: Request):
+    return await tunnel_proxy(tid, request)
 
 
-@app.api_route("/{tid}", methods=_ALL_METHODS)
-async def proxy_root(tid: str, request: Request):
-    return await tunnel_proxy(tid, "", request)
-
-
-# MARK: Dashboard — StaticFiles serves index.html at "/" (mounted LAST so the
-# API and /{tid} proxy routes above take precedence). https://fastapi.tiangolo.com/tutorial/frontend/
-app.mount("/", StaticFiles(directory=_frontend, html=True), name="frontend")
+# MARK: Dashboard at "/" — path operations always win over frontend files.
+# https://fastapi.tiangolo.com/tutorial/frontend/
+app.frontend("/", directory=pathlib.Path(__file__).parent / "frontend")
 
 
 if __name__ == "__main__":

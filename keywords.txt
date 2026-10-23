@@ -27,6 +27,10 @@ tunnelReady	KEYWORD2
 tunnelProviderName	KEYWORD2
 tunnelLastIP	KEYWORD2
 tunnelCACert	KEYWORD2
+tunnelContentType	KEYWORD2
+tunnelProgmem	KEYWORD2
+tunnelFile	KEYWORD2
+tunnelMime	KEYWORD2
 
 #######################################
 # Constants (LITERAL1)

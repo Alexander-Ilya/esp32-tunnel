@@ -1,11 +1,11 @@
 [project]
 name = "esp32-tunnel-server"
-version = "2.0.0"
+version = "5.0.0"
 description = "Self-hosted tunnel relay server for ESP32"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
-    "fastapi[standard]>=0.115.0",
+    "fastapi[standard]>=0.161",
     "psutil>=5.9.0",
 ]
 

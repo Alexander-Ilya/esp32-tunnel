@@ -1,35 +1,25 @@
-/*
- * esp32tunnel_localtunnel.h — Localtunnel (loca.lt) provider
- * Internal — included by esp32tunnel.h, do not include directly.
- */
+// localtunnel (loca.lt) provider — internal, included by esp32tunnel.h.
 
 #ifndef ESP32TUNNEL_LOCALTUNNEL_H
 #define ESP32TUNNEL_LOCALTUNNEL_H
 
-// ---------------------------------------------------------------------------
 // MARK: State
-// ---------------------------------------------------------------------------
 
-static struct {
+static struct : _TunBase {
   TunnelHandler handler;
   TunnelMode mode;
-  String option, host, id, url, lastIP;
+  String option, host, id;
   String ltHost;
   int ltPort;
   unsigned long ltRealloc;
-  _Phase phase;
-  unsigned long waitUntil;
-  bool ready, stop, started;
-} _lt = {};
+} _lt;
 
 static WiFiClient   _pool[TUN_POOL];
 static unsigned long _poolAge[TUN_POOL];
 static unsigned long _poolAliveCheck[TUN_POOL];
 static WiFiClient    _ltLocal;
 
-// ---------------------------------------------------------------------------
-// MARK: TLS helper (only used for loca.lt HTTPS API)
-// ---------------------------------------------------------------------------
+// TLS only for the loca.lt allocation API
 
 static bool _tlsConnect(WiFiClientSecure &tls, const char *host, uint16_t port) {
   tls.setInsecure();
@@ -41,11 +31,9 @@ static bool _tlsConnect(WiFiClientSecure &tls, const char *host, uint16_t port) 
 #endif
 }
 
-// =========================================================================
-// MARK: Pool management
-// =========================================================================
+// MARK: Connection pool
 
-// MARK: Cached alive check — getsockopt only every 5s per slot
+// getsockopt at most every 5 s per slot
 static bool _ltIsAlive(int i) {
   if (!_pool[i].connected()) return false;
   if (millis() - _poolAliveCheck[i] < 5000) return true;
@@ -80,9 +68,7 @@ static void _ltStopAll() {
   for (int i = 0; i < TUN_POOL; i++) _pool[i].stop();
 }
 
-// =========================================================================
 // MARK: HTTP handling
-// =========================================================================
 
 static bool _ltReadRequest(WiFiClient &c, String &method, String &path,
                            String &xff, String &ct, String &body) {
@@ -125,8 +111,8 @@ static bool _ltReadRequest(WiFiClient &c, String &method, String &path,
 }
 
 static void _ltSendError(WiFiClient &c, int code, const char *msg) {
-  c.printf("HTTP/1.1 %d Error\r\nContent-Type: text/plain\r\nConnection: close\r\n"
-           "Content-Length: %d\r\n\r\n%s", code, (int)strlen(msg), msg);
+  c.printf("HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nConnection: close\r\n"
+           "Content-Length: %d\r\n\r\n%s", code, _httpStatus(code), (int)strlen(msg), msg);
   c.flush(); c.stop();
 }
 
@@ -152,7 +138,7 @@ static void _ltProxyHTTP(WiFiClient &remote) {
     } else { if (!_ltLocal.connected()) break; _DELAY(1); }
   }
   _ltLocal.stop(); remote.flush(); remote.stop();
-  if (_tunAutoLog) _TUN_LOG(ip.c_str(), method.c_str(), path.c_str(), code);
+  _tunLog(ip, method, path, code);
 }
 
 static void _ltHandlerHTTP(WiFiClient &remote) {
@@ -161,20 +147,19 @@ static void _ltHandlerHTTP(WiFiClient &remote) {
   String ip = xff.length() ? xff : remote.remoteIP().toString();
   _lt.lastIP = ip;
 
+  _tunType = _TUN_DEFAULT_TYPE;
   String respBody = _lt.handler(method, path);
   int code = respBody.length() ? 200 : 404;
   if (!respBody.length()) respBody = "Not Found";
-  remote.printf("HTTP/1.1 %d %s\r\nContent-Type: text/html; charset=utf-8\r\n"
+  remote.printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
                 "Connection: close\r\nContent-Length: %d\r\n\r\n",
-                code, _httpStatus(code), (int)respBody.length());
+                code, _httpStatus(code), _tunType.c_str(), (int)respBody.length());
   remote.print(respBody);
   remote.flush(); remote.stop();
-  if (_tunAutoLog) _TUN_LOG(ip.c_str(), method.c_str(), path.c_str(), code);
+  _tunLog(ip, method, path, code);
 }
 
-// =========================================================================
 // MARK: Allocation + init + serve
-// =========================================================================
 
 static bool _ltAllocate() {
   WiFiClientSecure tls;
@@ -241,57 +226,25 @@ static bool _ltServe() {
   return true;
 }
 
-// =========================================================================
-// MARK: Internal API (called by dispatch in esp32tunnel.h)
-// =========================================================================
+// MARK: Internal API (dispatched from esp32tunnel.h)
 
 static void _ltBegin(TunnelHandler handler, const char *subdomain, TunnelMode mode) {
   if (_lt.started) return;
   _lt.handler = handler;
   _lt.mode    = mode;
   _lt.option  = subdomain ? subdomain : "";
-  _lt.stop    = false;
-  _lt.ready   = false;
-  _lt.started = true;
-  _lt.url     = "(connecting...)";
-  _lt.phase   = _PH_INIT;
+  _tunBegin(_lt);
 }
 
-static unsigned long _ltBackoff = 2000;
-
 static void _ltLoop() {
-  if (!_lt.started || _lt.stop) return;
-  switch (_lt.phase) {
-    case _PH_IDLE: break;
-    case _PH_INIT:
-      if (_ltInit()) { _lt.phase = _PH_SERVE; _ltBackoff = 2000; }
-      else {
-        unsigned long cap = (_lt.mode == TUN_STRICT && _lt.option.length()) ? 300000UL : 60000UL;
-        _lt.phase = _PH_WAIT; _lt.waitUntil = millis() + _ltBackoff;
-        _ltBackoff = min(_ltBackoff * 2, cap);
-      }
-      break;
-    case _PH_SERVE:
-      if (!_ltServe()) {
-        _lt.ready = false;
-        _ltStopAll();
-        if (!TUN_RECONNECT) { _lt.phase = _PH_IDLE; _lt.started = false; }
-        else { _lt.phase = _PH_WAIT; _lt.waitUntil = millis() + _ltBackoff; _ltBackoff = min(_ltBackoff * 2, 60000UL); }
-      }
-      break;
-    case _PH_WAIT:
-      if (millis() >= _lt.waitUntil) _lt.phase = _PH_INIT;
-      break;
-  }
+  // STRICT waits longer for a taken subdomain to free up
+  unsigned long cap = (_lt.mode == TUN_STRICT && _lt.option.length()) ? 300000UL : 60000UL;
+  _tunStep(_lt, 2000, cap, _ltInit, _ltServe, _ltStopAll);
 }
 
 static void _ltStop() {
-  _lt.stop = true;
   _ltStopAll();
-  _lt.ready   = false;
-  _lt.started = false;
-  _lt.phase   = _PH_IDLE;
-  _lt.url     = "(stopped)";
+  _tunEnd(_lt);
 }
 
 #endif

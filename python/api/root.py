@@ -1,39 +1,30 @@
-# MARK: Status endpoint — cgroup-aware for containers
-"""Status, health check, and server info."""
-
+# MARK: Status endpoint — cgroup-aware, so Render/Docker report the container's limits
 import os
 import time
+from pathlib import Path
 
 import psutil
-from pathlib import Path
-from pydantic import BaseModel
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 from api.tunnel import tunnels
 
 router = APIRouter(tags=["Root"])
 
 _start = time.time()
+_MB = 1024 * 1024
 
 
-# MARK: Read cgroup values (v2 first, v1 fallback)
-def _read_cgroup(v2_path: str, v1_path: str, is_cpu_max_period: bool = False) -> int | None:
-    """Read value from cgroups (v2 first, then v1)."""
-    for path in [v2_path, v1_path]:
-        p = Path(path)
-        if p.exists():
-            val = p.read_text().strip()
-            # cpu.max contains "quota period"
-            if path == "/sys/fs/cgroup/cpu.max" and " " in val:
-                parts = val.split()
-                val = parts[1] if is_cpu_max_period and len(parts) > 1 else parts[0]
-            if val not in ("max", ""):
-                try:
-                    v = int(val)
-                    if v < 9223372036854771712:  # Not "unlimited"
-                        return v
-                except ValueError:
-                    pass
+# MARK: First readable cgroup value (v2 path first, then v1); None = missing/unlimited.
+# `field` picks a column — cgroup v2 cpu.max is "quota period".
+def _cgroup(*paths: str, field: int = 0) -> int | None:
+    for p in paths:
+        try:
+            parts = Path(p).read_text().split()
+            v = int(parts[min(field, len(parts) - 1)])
+        except (OSError, ValueError, IndexError):   # missing file, or "max"
+            continue
+        return v if 0 < v < 2**62 else None          # v1 "unlimited" is ~2**63
     return None
 
 
@@ -55,51 +46,28 @@ class Status(BaseModel):
 
 @router.get("/status", response_model=Status, summary="System status")
 async def status():
-    """Container/system memory and health status."""
-    proc = psutil.Process(os.getpid())
-    rss = proc.memory_info().rss
+    """Container (or host) memory/CPU, active tunnels, uptime."""
+    limit = _cgroup("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    used = _cgroup("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    if not (limit and used):
+        vm = psutil.virtual_memory()
+        limit, used = vm.total, vm.used
 
-    # MARK: Container limits (cgroups)
-    limit = _read_cgroup("/sys/fs/cgroup/memory.max",
-                         "/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    used = _read_cgroup("/sys/fs/cgroup/memory.current",
-                        "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    quota = _cgroup("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period = _cgroup("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_period_us", field=1) or 100000
+    cpus = quota / period if quota else (psutil.cpu_count() or 1)
 
-    # MARK: CPU quota from cgroups
-    cpu_quota = _read_cgroup("/sys/fs/cgroup/cpu.max",
-                             "/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-    cpu_period = _read_cgroup("/sys/fs/cgroup/cpu.max",
-                              "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
-                              is_cpu_max_period=True) or 100000
-
-    if limit and used:
-        limit_mb = limit / (1024 * 1024)
-        used_mb = used / (1024 * 1024)
-    else:
-        mem = psutil.virtual_memory()
-        limit_mb = mem.total / (1024 * 1024)
-        used_mb = mem.used / (1024 * 1024)
-
-    # MARK: Effective CPU count (0.1 vCPU = 0.1)
-    if cpu_quota and cpu_quota > 0:
-        effective_cpus = cpu_quota / cpu_period
-    else:
-        effective_cpus = psutil.cpu_count() or 1
-
-    free_mb = limit_mb - used_mb
-    process_mb = rss / (1024 * 1024)
-    percent = (used_mb / limit_mb * 100) if limit_mb > 0 else 0
-
+    percent = used / limit * 100
     return Status(
         ok=percent < 95,
         tunnels=len(tunnels),
         uptime=int(time.time() - _start),
         memory=Memory(
-            limit_mb=round(limit_mb, 1),
-            used_mb=round(used_mb, 1),
-            free_mb=round(free_mb, 1),
-            process_mb=round(process_mb, 1),
+            limit_mb=round(limit / _MB, 1),
+            used_mb=round(used / _MB, 1),
+            free_mb=round((limit - used) / _MB, 1),
+            process_mb=round(psutil.Process(os.getpid()).memory_info().rss / _MB, 1),
             percent=round(percent, 1),
         ),
-        cpu_count=round(effective_cpus, 2),
+        cpu_count=round(cpus, 2),
     )

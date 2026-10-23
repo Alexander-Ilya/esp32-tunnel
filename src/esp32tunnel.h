@@ -5,9 +5,13 @@
  *   #include <esp32tunnel.h>
  *   tunnelSetup(SELFHOST, "https://myserver.com/my-device");
  *   tunnelSetup(SELFHOST, "http://myserver.local/my-device");
+ *   tunnelSetup(SELFHOST, handler, "https://myserver.com/my-device");   // no web server needed
  *   tunnelSetup(LOCALTUNNEL, "my-esp32");
  *   tunnelSetup(BORE);                                // bore.pub random port
  *   tunnelSetup(BORE, "my-server.com");               // self-hosted bore
+ *
+ * Handler-mode assets: #include <esp32tunnel_progmem.h> or <esp32tunnel_littlefs.h>
+ * Tuning (before the include): TUN_MAX_BODY, TUN_TASK_PRIO, TUN_TASK_STACK, TUN_MDNS
  */
 
 #ifndef ESP32TUNNEL_H
@@ -27,35 +31,41 @@
 
 #include <WiFiClientSecure.h>
 
-static const char* _httpStatus(int c) {
-  switch (c) {
-    case 200: return "OK"; case 201: return "Created"; case 204: return "No Content";
-    case 301: return "Moved"; case 302: return "Found"; case 304: return "Not Modified";
-    case 400: return "Bad Request"; case 403: return "Forbidden"; case 404: return "Not Found";
-    case 500: return "Internal Error"; case 502: return "Bad Gateway"; case 504: return "Timeout";
-    default: return "";
-  }
+// MARK: HTTP status + access log
+
+static const char *_httpStatus(int code) {
+  static const struct { int code; const char *text; } table[] = {
+    {200, "OK"}, {201, "Created"}, {204, "No Content"},
+    {301, "Moved Permanently"}, {302, "Found"}, {304, "Not Modified"},
+    {400, "Bad Request"}, {401, "Unauthorized"}, {403, "Forbidden"}, {404, "Not Found"},
+    {413, "Payload Too Large"}, {500, "Internal Server Error"}, {502, "Bad Gateway"},
+    {503, "Service Unavailable"}, {504, "Gateway Timeout"},
+  };
+  for (auto &s : table) if (s.code == code) return s.text;
+  return "";
 }
 
-#ifdef ESP32
-  #include <rtosSerial.h>
-  #define _TUN_LOG(ip, m, p, s) rtosSerial.printf("INFO:     %s - \"%s %s HTTP/1.1\" %d %s\n", ip, m, p, s, _httpStatus(s))
-#else
-  #define _TUN_LOG(ip, m, p, s) Serial.printf("INFO:     %s - \"%s %s HTTP/1.1\" %d %s\n", ip, m, p, s, _httpStatus(s))
-#endif
+static bool _tunAutoLog = false;
 
-// ---------------------------------------------------------------------------
-// Shared types & config
-// ---------------------------------------------------------------------------
+// tunnelLog() line, uvicorn style. Serial is task-safe on ESP32.
+static void _tunLog(const String &ip, const String &method, const String &path, int code) {
+  if (_tunAutoLog)
+    Serial.printf("INFO:     %s - \"%s %s HTTP/1.1\" %d %s\n",
+                  ip.c_str(), method.c_str(), path.c_str(), code, _httpStatus(code));
+}
+
+// MARK: Types & config
 
 enum TunnelProvider { SELFHOST, LOCALTUNNEL, BORE };
 enum TunnelMode { TUN_STRICT, TUN_FLEX };
 
 typedef String (*TunnelHandler)(const String &method, const String &path);
 
-static bool _tunAutoLog = false;
+// Handler mode: set the response Content-Type from inside a TunnelHandler (reset per request).
+#define _TUN_DEFAULT_TYPE "text/html; charset=utf-8"
+static String _tunType = _TUN_DEFAULT_TYPE;
+inline void tunnelContentType(const char *type) { _tunType = type; }
 
-// MARK: Route-based access control
 struct RouteConfig {
   const char *path;
   const char *password;   // nullptr = public
@@ -67,8 +77,7 @@ struct RouteConfig {
 static RouteConfig _tunRoutes[TUN_MAX_ROUTES];
 static int _tunRouteCount = 0;
 
-// MARK: Access key — secure by default. Auto-generated (NVS, persisted) unless
-// the sketch overrides; sent on the handshake and required on every request.
+// Access key: auto-generated once and kept in NVS, unless the sketch sets one or opts out.
 static String _tunKey;            // "" = open access (insecure)
 static bool _tunAutoAuth = true;
 
@@ -114,20 +123,17 @@ static String _tunMakeKey() {
 #define TUN_REALLOC 12
 #endif
 
-// MARK: Background task (ESP32) — tunnelSetup() runs the tunnel in its own task.
 #ifndef TUN_TASK_STACK
-#define TUN_TASK_STACK 8192      // proven enough for the WS + TLS path
+#define TUN_TASK_STACK 8192      // enough for the WS + TLS path
 #endif
 #ifndef TUN_TASK_PRIO
-#define TUN_TASK_PRIO 1
+#define TUN_TASK_PRIO 2      // above loopTask (1): at equal priority a busy loop() wedged the socket
 #endif
 #ifndef TUN_TASK_CORE
 #define TUN_TASK_CORE 1
 #endif
 
-// ---------------------------------------------------------------------------
-// MARK: Platform abstraction
-// ---------------------------------------------------------------------------
+// MARK: Platform
 
 #ifdef ESP32
   #define _DELAY(ms) vTaskDelay(pdMS_TO_TICKS(ms))
@@ -140,7 +146,14 @@ static const int _LOCAL_TIMEOUT = 5000;
 static const int _DRAIN_TIMEOUT = 200;
 static const int _HDR_TIMEOUT   = 3000;
 static const int _MAX_HDR_SIZE  = 4096;
-static const int _MAX_BODY_SIZE = 16384;
+#ifndef TUN_MAX_BODY
+#define TUN_MAX_BODY 16384      // largest body (bytes), announced to the relay
+#endif
+#ifdef BOARD_HAS_PSRAM
+static const int _MAX_BODY_SIZE = TUN_MAX_BODY;
+#else                           // bodies live in one String, which caps at 65535 B without PSRAM
+static const int _MAX_BODY_SIZE = TUN_MAX_BODY < 65535 ? TUN_MAX_BODY : 65535;
+#endif
 
 enum _Phase { _PH_IDLE, _PH_INIT, _PH_SERVE, _PH_WAIT };
 
@@ -172,9 +185,7 @@ static String _chipID() {
   return String(buf);
 }
 
-// ---------------------------------------------------------------------------
 // MARK: JSON helpers
-// ---------------------------------------------------------------------------
 
 static int _jFind(const String &j, const char *key) {
   const char *s = j.c_str();
@@ -194,25 +205,18 @@ static int _jFind(const String &j, const char *key) {
 static String _jStr(const String &j, const char *key) {
   int i = _jFind(j, key);
   if (i < 0 || j[i] != '"') return "";
-  i++;
-  char stack[128]; int pos = 0; bool heap = false;
-  String out;
-  while (i < (int)j.length() && j[i] != '"') {
-    char c;
-    if (j[i] == '\\' && i + 1 < (int)j.length()) {
+  int end = ++i, len = j.length();
+  while (end < len && j[end] != '"') end += (j[end] == '\\') ? 2 : 1;
+  String out; out.reserve(end - i);
+  for (; i < end && i < len; i++) {
+    char c = j[i];
+    if (c == '\\' && i + 1 < len) {
       char e = j[++i];
       c = (e == 'n') ? '\n' : (e == 'r') ? '\r' : (e == 't') ? '\t' : e;
-    } else c = j[i];
-    if (!heap && pos < 127) { stack[pos++] = c; }
-    else {
-      if (!heap) { heap = true; out.reserve(256); out.concat(stack, pos); }
-      out += c;
     }
-    i++;
+    out += c;
   }
-  if (heap) return out;
-  stack[pos] = 0;
-  return String(stack);
+  return out;
 }
 
 static int _jInt(const String &j, const char *key, int def = 0) {
@@ -249,9 +253,7 @@ static void _writeHdrs(WiFiClient &local, const String &msg) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// MARK: Shared helpers
-// ---------------------------------------------------------------------------
+// MARK: Socket helpers
 
 static void _setKeepAlive(WiFiClient &c) {
 #ifdef ESP32
@@ -270,7 +272,6 @@ static bool _hdrMatch(const char *h, const char *prefix) {
   return strncasecmp(h, prefix, strlen(prefix)) == 0;
 }
 
-// MARK: Read line into caller buffer — zero heap allocation
 static int _readLineBuf(WiFiClient &c, char *buf, int maxLen, int timeoutMs) {
   int pos = 0;
   unsigned long t = millis();
@@ -284,9 +285,7 @@ static int _readLineBuf(WiFiClient &c, char *buf, int maxLen, int timeoutMs) {
   return pos;
 }
 
-// ---------------------------------------------------------------------------
-// MARK: Local HTTP proxy (forward to ESPAsyncWebServer on TUN_PORT)
-// ---------------------------------------------------------------------------
+// MARK: Local proxy — forward to the sketch's web server on TUN_PORT
 
 static bool _openLocal(WiFiClient &local, const String &method, const String &path,
                        const String &ip, const String &body, const String &ct,
@@ -349,40 +348,84 @@ static String _readLocalBody(WiFiClient &local, int contentLen) {
   return body;
 }
 
-// ---------------------------------------------------------------------------
-// MARK: Include providers
-// ---------------------------------------------------------------------------
+// MARK: Provider state + reconnect loop
+
+struct _TunBase {
+  String url, lastIP;
+  bool ready, stop, started;
+  _Phase phase;
+  unsigned long waitUntil, backoff;
+};
+
+static void _tunBegin(_TunBase &t) {
+  t.stop = false; t.ready = false; t.started = true;
+  t.url = "(connecting...)"; t.phase = _PH_INIT;
+}
+
+static void _tunEnd(_TunBase &t) {
+  t.stop = true; t.ready = false; t.started = false;
+  t.url = "(stopped)"; t.phase = _PH_IDLE;
+}
+
+// init/serve return false on failure; drop() closes sockets after serve fails.
+// Failures back off exponentially from `base` up to `cap`.
+static void _tunStep(_TunBase &t, unsigned long base, unsigned long cap,
+                     bool (*init)(), bool (*serve)(), void (*drop)()) {
+  if (!t.started || t.stop) return;
+  switch (t.phase) {
+    case _PH_IDLE: return;
+    case _PH_INIT:
+      if (init()) { t.phase = _PH_SERVE; t.backoff = base; return; }
+      break;
+    case _PH_SERVE:
+      if (serve()) return;
+      drop(); t.ready = false;
+      if (!TUN_RECONNECT) { t.phase = _PH_IDLE; t.started = false; return; }
+      break;
+    case _PH_WAIT:
+      if ((long)(millis() - t.waitUntil) >= 0) t.phase = _PH_INIT;   // wrap-safe
+      return;
+  }
+  if (!t.backoff) t.backoff = base;
+  t.phase = _PH_WAIT; t.waitUntil = millis() + t.backoff;
+  t.backoff = min(t.backoff * 2, cap);
+}
+
+// MARK: Providers
 
 #include "esp32tunnel_selfhosted.h"
 #include "esp32tunnel_localtunnel.h"
 #include "esp32tunnel_bore.h"
 
-// ---------------------------------------------------------------------------
-// MARK: Active provider tracker
-// ---------------------------------------------------------------------------
-
 static TunnelProvider _tunProvider = SELFHOST;
 
-// ---------------------------------------------------------------------------
-// MARK: Public API — dispatch to active provider
-// ---------------------------------------------------------------------------
+static _TunBase &_tunCur() {
+  if (_tunProvider == SELFHOST) return _sh;
+  if (_tunProvider == BORE)     return _bore;
+  return _lt;
+}
 
-// MARK: Drive the active provider once
+// MARK: Public API
+
 static inline void _tunService() {
   if (_tunProvider == SELFHOST)      _shLoop();
   else if (_tunProvider == BORE)     _boreLoop();
   else                               _ltLoop();
 }
 
-// MARK: Background task — owns the tunnel so the sketch's loop() stays free
+// ESP32: a FreeRTOS task owns the tunnel, so the sketch's loop() stays free.
 #ifdef ESP32
 static TaskHandle_t _tunTask = nullptr;
 static volatile bool _tunTaskRun = false;
 
 static void _tunTaskFn(void *) {
-  while (_tunTaskRun) { _tunService(); vTaskDelay(pdMS_TO_TICKS(10)); }
+  while (_tunTaskRun) {
+    _tunService();
+    // A serving self-hosted tunnel already sleeps in select(); the rest poll every 10 ms.
+    if (!(_tunProvider == SELFHOST && _sh.ready)) vTaskDelay(pdMS_TO_TICKS(10));
+  }
   _tunTask = nullptr;
-  vTaskDelete(nullptr);            // clean self-exit (never killed mid-TLS)
+  vTaskDelete(nullptr);
 }
 
 static inline void _tunStartTask() {
@@ -393,27 +436,22 @@ static inline void _tunStartTask() {
 }
 #endif
 
-// MARK: tunnelSetup overloads
-
 inline void tunnelSetup(TunnelProvider p, TunnelHandler handler,
                         const char *option, TunnelMode mode = TUN_FLEX) {
   _tunProvider = p;
-  // Secure by default — auto-generate a key unless the sketch set one or opted out.
   if (p == SELFHOST && !_tunKey.length() && _tunAutoAuth && !_tunRouteCount)
     _tunKey = _tunMakeKey();
   if (p == SELFHOST)      _shBegin(handler, option);
   else if (p == BORE)     _boreBegin(option, TUN_PORT);
   else                    _ltBegin(handler, option, mode);
 #ifdef ESP32
-  _tunStartTask();                 // no tunnelLoop() needed on ESP32
+  _tunStartTask();
 #endif
 }
 
 inline void tunnelSetup(TunnelProvider p, const char *option) {
   tunnelSetup(p, (TunnelHandler)nullptr, option, TUN_FLEX);
 }
-// (p, handler, option) uses the main overload's default mode — a separate
-// 3-arg version would make it ambiguous.
 
 inline void tunnelSetup(TunnelProvider p, const char *option, TunnelMode mode) {
   tunnelSetup(p, (TunnelHandler)nullptr, option, mode);
@@ -423,14 +461,12 @@ inline void tunnelSetup(TunnelProvider p) {
   tunnelSetup(p, (TunnelHandler)nullptr, nullptr, TUN_FLEX);
 }
 
-// MARK: tunnelSetup with a custom password — whole tunnel uses this key
 inline void tunnelSetup(TunnelProvider p, const char *option, const char *password) {
   _tunAutoAuth = false;
   _tunKey = password ? password : "";
   tunnelSetup(p, (TunnelHandler)nullptr, option, TUN_FLEX);
 }
 
-// MARK: tunnelSetup with RouteConfig — per-route authentication
 template <size_t N>
 inline void tunnelSetup(TunnelProvider p, const char *option, const RouteConfig (&routes)[N]) {
   _tunRouteCount = (int)(N > TUN_MAX_ROUTES ? TUN_MAX_ROUTES : N);
@@ -438,12 +474,10 @@ inline void tunnelSetup(TunnelProvider p, const char *option, const RouteConfig 
   tunnelSetup(p, (TunnelHandler)nullptr, option, TUN_FLEX);
 }
 
-// MARK: Access control (call BEFORE tunnelSetup). Default = auto key;
-// tunnelPublic() = open; custom = tunnelSetup(SELFHOST, server, "pass").
+// Call before tunnelSetup(): open access, no key.
 inline void tunnelPublic() { _tunAutoAuth = false; _tunKey = ""; }
 inline const char* tunnelKey() { return _tunKey.c_str(); }
 
-// MARK: Direct LAN URL (http://<id>.local) — fastest path on the same network
 inline String tunnelLocalURL() {
   if (_tunProvider != SELFHOST) return "";
   String u = "http://" + _sh.id + ".local";
@@ -451,10 +485,9 @@ inline String tunnelLocalURL() {
   return u;
 }
 
-// MARK: tunnelLog — toggle access logging (replaces tunnelLoop(true))
 inline void tunnelLog(bool enable = true) { _tunAutoLog = enable; }
 
-// MARK: tunnelLoop — ESP8266 only. On ESP32 the task drives it; this is a no-op.
+// ESP8266 only — on ESP32 the task drives the tunnel and this is a no-op.
 inline void tunnelLoop(bool log = false) {
   _tunAutoLog = log;
 #ifdef ESP32
@@ -465,7 +498,7 @@ inline void tunnelLoop(bool log = false) {
 
 inline void tunnelStop() {
 #ifdef ESP32
-  // Ask the task to exit and wait (≤1s) so sockets aren't torn down under it.
+  // Let the task exit (≤1 s) so sockets aren't torn down under it.
   if (_tunTask && _tunTask != xTaskGetCurrentTaskHandle()) {
     _tunTaskRun = false;
     for (int i = 0; i < 200 && _tunTask; i++) _DELAY(5);
@@ -476,25 +509,9 @@ inline void tunnelStop() {
   else                               _ltStop();
 }
 
-// MARK: Status getters
-
-inline String tunnelURL() {
-  if (_tunProvider == SELFHOST) return _sh.url;
-  if (_tunProvider == BORE)     return _bore.url;
-  return _lt.url;
-}
-
-inline bool tunnelReady() {
-  if (_tunProvider == SELFHOST) return _sh.ready;
-  if (_tunProvider == BORE)     return _bore.ready;
-  return _lt.ready;
-}
-
-inline String tunnelLastIP() {
-  if (_tunProvider == SELFHOST) return _sh.lastIP;
-  if (_tunProvider == BORE)     return _bore.lastIP;
-  return _lt.lastIP;
-}
+inline String tunnelURL()    { return _tunCur().url; }
+inline bool   tunnelReady()  { return _tunCur().ready; }
+inline String tunnelLastIP() { return _tunCur().lastIP; }
 
 inline const char* tunnelProviderName() {
   if (_tunProvider == SELFHOST) return "self-hosted";
@@ -502,7 +519,7 @@ inline const char* tunnelProviderName() {
   return "localtunnel";
 }
 
-// MARK: Optional TLS cert verification (self-hosted provider only)
+// Self-hosted only: verify the relay's TLS cert (nullptr/"" = don't verify).
 inline void tunnelCACert(const char *pem) {
   if (!_shWsTLS) {
     _shWsTLS = new WiFiClientSecure();

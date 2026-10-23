@@ -1,0 +1,6 @@
+# arduino-cli sketch project file — read from the sketch folder being built.
+# Copy into an example (e.g. examples/SelfHosted/) to drop --fqbn/--port/--config flags.
+default_fqbn: esp32:esp32:esp32
+default_port: COM3
+default_port_config:
+  baudrate: 115200

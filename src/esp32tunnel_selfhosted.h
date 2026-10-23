@@ -1,465 +1,277 @@
-/*
- * esp32tunnel_selfhosted.h — Self-hosted relay provider
- * Internal — included by esp32tunnel.h, do not include directly.
- */
+// Self-hosted relay provider — internal, included by esp32tunnel.h.
+//
+// One task owns the WebSocket and never blocks in write() while it isn't reading:
+// a writer that stops reading can deadlock lwIP (the relay's ACKs ride on data that
+// gets refused once our RX mailbox is full). So every byte read lands in _shRx and is
+// parsed only as complete frames, and writes go out only when select() says they fit.
 
 #ifndef ESP32TUNNEL_SELFHOSTED_H
 #define ESP32TUNNEL_SELFHOSTED_H
 
-// ---------------------------------------------------------------------------
-// MARK: State
-// ---------------------------------------------------------------------------
-
-static WiFiClient _shWsPlain;
-static WiFiClient _shLocal;
+static WiFiClient _shWsPlain, _shLocal;
 static WiFiClientSecure *_shWsTLS = nullptr;
 
-static struct {
+static struct : _TunBase {
   TunnelHandler handler;
-  String option, host, id, url, lastIP;
+  String host, id;
   WiFiClient *ws;
   bool useTLS;
   int shPort;
-  _Phase phase;
-  unsigned long waitUntil;
-  bool ready, stop, started;
-} _sh = {};
+} _sh;
 
-// =========================================================================
-// MARK: WebSocket framing (plain WiFiClient)
-// =========================================================================
+static String _shRx;                    // bytes from the relay, not yet parsed
+static unsigned long _shLastRx, _shLastPing;
 
-static String _wsRecv() {
-  uint8_t b0, b1;
-  int opcode;
-  for (;;) {
-    if (!_sh.ws->connected() || !_sh.ws->available()) return "";
-    b0 = _sh.ws->read(); b1 = _sh.ws->read();
-    opcode = b0 & 0x0F;
-    if (opcode == 0x08) return "";
-    if (opcode == 0x09) {
-      // MARK: Stream pong — echo ping payload (cap at 125 bytes per WS spec)
-      int pLen = b1 & 0x7F;
-      if (pLen >= 126) { for (int k = 0; k < pLen; k++) _sh.ws->read(); continue; }
-      uint8_t hdr[6] = {0x8A, (uint8_t)(pLen | 0x80), 0, 0, 0, 0};
-      _sh.ws->write(hdr, 6);
-      for (int k = 0; k < pLen; k++) _sh.ws->write((uint8_t)_sh.ws->read());
-      continue;
-    }
-    if (opcode == 0x0A) {
-      for (int k = 0, n = b1 & 0x7F; k < n; k++) _sh.ws->read();
-      continue;
-    }
-    break;
-  }
+// MARK: Socket I/O
 
-  bool masked = b1 & 0x80;
-  int len = b1 & 0x7F;
-  if (len == 126) {
-    len = (_sh.ws->read() << 8) | _sh.ws->read();
-  } else if (len == 127) {
-    uint32_t hi = 0, lo = 0;
-    for (int i = 0; i < 4; i++) hi = (hi << 8) | _sh.ws->read();
-    for (int i = 0; i < 4; i++) lo = (lo << 8) | _sh.ws->read();
-    len = (hi == 0 && lo <= (uint32_t)_MAX_BODY_SIZE) ? (int)lo : 0;
-  }
-  uint8_t mask[4] = {0};
-  if (masked) for (int i = 0; i < 4; i++) mask[i] = _sh.ws->read();
-  if (len > _MAX_BODY_SIZE || len <= 0) return "";
-
-  String out; out.reserve(len);
-  uint8_t buf[256]; int got = 0;
-  unsigned long rt = millis();
-  while (got < len && _sh.ws->connected() && millis() - rt < 30000) {
-    int avail = _sh.ws->available();
-    if (!avail) { _DELAY(1); continue; }
-    int chunk = min(avail, min((int)sizeof(buf), len - got));
-    int r = _sh.ws->read(buf, chunk);
-    if (r > 0) {
-      if (masked) for (int i = 0; i < r; i++) buf[i] ^= mask[(got + i) & 3];
-      out.concat((const char*)buf, r);
-      got += r; rt = millis();
-    }
-  }
-  return out;
+// Sleep in select() until the socket is readable/writable, or `ms` passes.
+static bool _shWait(bool write, int ms) {
+  int fd = _sh.ws->fd();
+  if (fd < 0) return false;
+  fd_set s; FD_ZERO(&s); FD_SET(fd, &s);
+  timeval tv = {ms / 1000, (ms % 1000) * 1000};
+  return select(fd + 1, write ? nullptr : &s, write ? &s : nullptr, nullptr, &tv) > 0;
 }
 
-static bool _wsConnect() {
-  if (_sh.useTLS) {
-    if (!_shWsTLS) {
-      _shWsTLS = new WiFiClientSecure();
-      _shWsTLS->setInsecure();
-    }
-    _sh.ws = _shWsTLS;
-  } else {
-    _sh.ws = &_shWsPlain;
+// Move everything readable into _shRx. false = connection gone or inbox overflow.
+static bool _shPump() {
+  static uint8_t buf[512];
+  int n;
+  while ((n = _sh.ws->available()) > 0 && (n = _sh.ws->read(buf, min(n, (int)sizeof buf))) > 0) {
+    _shRx.concat((const char *)buf, n);
+    _shLastRx = millis();
   }
-  if (!_tcpConnectHost(*_sh.ws, _sh.host.c_str(), _sh.shPort)) return false;
-  // Carry the access key on the handshake so the server can reject id hijacks.
-  String q = "?id=" + _sh.id;
-  if (_tunKey.length()) { q += "&token="; q += _tunKey; }
-  _sh.ws->printf(
-    "GET %s%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-    TUN_WS_PATH, q.c_str(), _sh.host.c_str()
-  );
-  unsigned long t0 = millis();
-  while (!_sh.ws->available() && millis() - t0 < _CONNECT_MS) _DELAY(10);
-  if (!_sh.ws->available()) { _sh.ws->stop(); return false; }
-  char line[128];
-  _readLineBuf(*_sh.ws, line, sizeof(line), _CONNECT_MS);
-  if (!strstr(line, "101")) { _sh.ws->stop(); return false; }
-  while (_sh.ws->connected()) {
-    int n = _readLineBuf(*_sh.ws, line, sizeof(line), _DRAIN_TIMEOUT);
-    if (n == 0) break;
+  return _sh.ws->connected() && _shRx.length() <= (unsigned)_MAX_BODY_SIZE * 2 + 1024;
+}
+
+// Write all of b, ≤1 KB per call, only when it fits; keep reading meanwhile.
+static bool _shSend(const uint8_t *b, size_t n) {
+  unsigned long progress = millis();
+  while (n) {
+    if (millis() - progress > 30000 || !_shPump()) return false;
+    if (!_shWait(true, 50)) continue;
+    int w = _sh.ws->write(b, min(n, (size_t)1024));
+    if (w <= 0) return false;
+    b += w; n -= w; progress = millis();
   }
-  _setKeepAlive(*_sh.ws);
   return true;
 }
 
-// =========================================================================
-// MARK: Response helpers — streaming to avoid double-buffering
-// =========================================================================
+// MARK: WebSocket frames (client frames must be masked — a zero mask is a no-op)
 
-// MARK: Count escaped length without allocating a String
-static int _escapeLen(const char *s, int len) {
-  int out = 0;
-  for (int i = 0; i < len; i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') out += 2;
-    else if ((uint8_t)c < 0x20) out += 6;  // \uXXXX
-    else out += 1;
-  }
-  return out;
+static bool _shFrame(uint8_t op, size_t len) {
+  uint8_t h[14]; int n = 0;
+  h[n++] = 0x80 | op;
+  if (len < 126) h[n++] = 0x80 | len;
+  else if (len <= 0xFFFF) { h[n++] = 0x80 | 126; h[n++] = len >> 8; h[n++] = len; }
+  else { h[n++] = 0x80 | 127; for (int i = 7; i >= 0; i--) h[n++] = i < 4 ? len >> (8 * i) : 0; }
+  memset(h + n, 0, 4);
+  return _shSend(h, n + 4);
 }
 
-// MARK: Write escaped chars directly to WS (128-byte buffer, no String alloc)
-static void _wsWriteEscaped(const char *s, int len) {
-  char buf[128]; int pos = 0;
-  for (int i = 0; i < len; i++) {
-    char c = s[i];
-    int need;
-    if (c == '"' || c == '\\') need = 2;
-    else if ((uint8_t)c < 0x20) need = 6;
-    else need = 1;
-    if (pos + need > (int)sizeof(buf)) {
-      _sh.ws->write((uint8_t*)buf, pos); pos = 0;
-    }
-    if (c == '"')       { buf[pos++] = '\\'; buf[pos++] = '"'; }
-    else if (c == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
-    else if ((uint8_t)c < 0x20) {
-      pos += snprintf(buf + pos, 7, "\\u%04x", (uint8_t)c);
-    }
-    else { buf[pos++] = c; }
-  }
-  if (pos > 0) _sh.ws->write((uint8_t*)buf, pos);
-}
-
-// MARK: Write WS frame header (payload length known upfront)
-static bool _wsBeginFrame(int payloadLen) {
-  if (!_sh.ws->connected()) return false;
-  uint8_t hdr[14]; int hlen = 0;
-  hdr[hlen++] = 0x81;
-  if (payloadLen < 126) {
-    hdr[hlen++] = payloadLen | 0x80;
-  } else if (payloadLen <= 65535) {
-    hdr[hlen++] = 126 | 0x80;
-    hdr[hlen++] = (payloadLen >> 8) & 0xFF;
-    hdr[hlen++] = payloadLen & 0xFF;
-  } else {
-    hdr[hlen++] = 127 | 0x80;
-    hdr[hlen++] = 0; hdr[hlen++] = 0; hdr[hlen++] = 0; hdr[hlen++] = 0;
-    hdr[hlen++] = (payloadLen >> 24) & 0xFF;
-    hdr[hlen++] = (payloadLen >> 16) & 0xFF;
-    hdr[hlen++] = (payloadLen >> 8) & 0xFF;
-    hdr[hlen++] = payloadLen & 0xFF;
-  }
-  uint8_t mask[4] = {0, 0, 0, 0};
-  memcpy(hdr + hlen, mask, 4); hlen += 4;
-  _sh.ws->write(hdr, hlen);
+// Take one complete frame off _shRx; false = not all here yet.
+static bool _shFrameIn(uint8_t &op, String &payload) {
+  const uint8_t *p = (const uint8_t *)_shRx.c_str();
+  size_t n = _shRx.length(), h = 2, len;
+  if (n < 2) return false;
+  len = p[1] & 0x7F;
+  if (len == 126) { if (n < 4) return false; len = p[2] << 8 | p[3]; h = 4; }
+  else if (len == 127) { if (n < 10) return false; len = 0; for (int i = 6; i < 10; i++) len = len << 8 | p[i]; h = 10; }
+  const uint8_t *mask = (p[1] & 0x80) ? p + h : nullptr;
+  if (mask) h += 4;
+  if (n < h + len) return false;
+  op = p[0] & 0x0F;
+  payload = _shRx.substring(h, h + len);
+  if (mask) for (size_t i = 0; i < len; i++) payload[i] ^= mask[i & 3];
+  _shRx.remove(0, h + len);
   return true;
 }
 
-// MARK: Stream JSON response — avoids _escape() String allocation
-static void _wsSendResponse(const String &rid, int code, const String &body, const String &type) {
-  // Build prefix into stack buffer (rid max ~36, code max 3 digits)
-  char prefix[80];
-  int plen = snprintf(prefix, sizeof(prefix),
-    "{\"id\":\"%s\",\"status\":%d,\"body\":\"", rid.c_str(), code);
-  if (plen >= (int)sizeof(prefix)) plen = sizeof(prefix) - 1;
-
-  int bodyEscLen = _escapeLen(body.c_str(), body.length());
-  int typeEscLen = _escapeLen(type.c_str(), type.length());
-  // ","type":"  = 10 chars,  "}  = 2 chars
-  int totalLen = plen + bodyEscLen + 10 + typeEscLen + 2;
-
-  if (!_wsBeginFrame(totalLen)) return;
-  _sh.ws->write((uint8_t*)prefix, plen);
-  _wsWriteEscaped(body.c_str(), body.length());
-  _sh.ws->write((const uint8_t*)"\",\"type\":\"", 10);
-  _wsWriteEscaped(type.c_str(), type.length());
-  _sh.ws->write((const uint8_t*)"\"}", 2);
-  _sh.ws->flush();
+static int _escLen(const String &s) {
+  int n = 0;
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t c = s[i];
+    n += (c == '"' || c == '\\') ? 2 : c < 0x20 ? 6 : 1;
+  }
+  return n;
 }
 
-static void _wsSendError(const String &rid, int code, const char *text) {
-  // Errors are small — no streaming needed
-  char buf[128];
-  int len = snprintf(buf, sizeof(buf),
-    "{\"id\":\"%s\",\"status\":%d,\"body\":\"%s\"}",
-    rid.c_str(), code, text);
-  if (len <= 0 || len >= (int)sizeof(buf)) return;
-  if (!_wsBeginFrame(len)) return;
-  _sh.ws->write((uint8_t*)buf, len);
-  _sh.ws->flush();
+// JSON-escape s straight onto the socket — no escaped copy in RAM.
+static bool _shSendEscaped(const String &s) {
+  static char buf[1024];
+  int pos = 0;
+  for (unsigned i = 0; i < s.length(); i++) {
+    if (pos > (int)sizeof buf - 6) { if (!_shSend((uint8_t *)buf, pos)) return false; pos = 0; }
+    char c = s[i];
+    if (c == '"' || c == '\\') { buf[pos++] = '\\'; buf[pos++] = c; }
+    else if ((uint8_t)c < 0x20) pos += snprintf(buf + pos, 7, "\\u%04x", (uint8_t)c);
+    else buf[pos++] = c;
+  }
+  return _shSend((uint8_t *)buf, pos);
 }
 
-// =========================================================================
-// MARK: Request handlers
-// =========================================================================
+// {"id":…,"status":…,"body":"…","type":"…"} as one text frame
+static void _shRespond(const String &rid, int code, const String &body, const String &type) {
+  char pre[80];
+  int plen = snprintf(pre, sizeof pre, "{\"id\":\"%s\",\"status\":%d,\"body\":\"", rid.c_str(), code);
+  int len = plen + _escLen(body) + 10 + _escLen(type) + 2;   // + ","type":"  + "}
+  _shFrame(0x1, len) && _shSend((uint8_t *)pre, plen) && _shSendEscaped(body) &&
+    _shSend((const uint8_t *)"\",\"type\":\"", 10) && _shSendEscaped(type) &&
+    _shSend((const uint8_t *)"\"}", 2);
+}
 
-static void _shLocalForward(const String &rid, const String &method,
-                            const String &path, const String &ip,
-                            const String &reqBody, const String &ct,
+// MARK: Requests
+
+static void _shLocalForward(const String &rid, const String &method, const String &path,
+                            const String &ip, const String &reqBody, const String &ct,
                             const String &rawMsg) {
   if (_shLocal.connected()) _shLocal.stop();
-  if (!_openLocal(_shLocal, method, path, ip, reqBody, ct, rawMsg)) {
-    _wsSendError(rid, 502, "Local server unreachable");
-    return;
-  }
+  if (!_openLocal(_shLocal, method, path, ip, reqBody, ct, rawMsg))
+    return _shRespond(rid, 502, "Local server unreachable", "text/plain");
   if (!_waitLocal(_shLocal)) {
     _shLocal.stop();
-    _wsSendError(rid, 504, "Local timeout");
-    return;
+    return _shRespond(rid, 504, "Local timeout", "text/plain");
   }
-  int code; String respCT; int respCL;
-  _parseLocalResponse(_shLocal, code, respCT, respCL);
-  String body = _readLocalBody(_shLocal, respCL);
+  int code, len; String type;
+  _parseLocalResponse(_shLocal, code, type, len);
+  if (len > _MAX_BODY_SIZE) {             // say so instead of sending a truncated page
+    _shLocal.stop();
+    return _shRespond(rid, 502, "Response larger than TUN_MAX_BODY", "text/plain");
+  }
+  String body = _readLocalBody(_shLocal, len);
   _shLocal.stop();
-  _wsSendResponse(rid, code, body, respCT);
-  if (_tunAutoLog) _TUN_LOG(ip.c_str(), method.c_str(), path.c_str(), code);
+  _shRespond(rid, code, body, type);
+  _tunLog(ip, method, path, code);
 }
 
-static void _shHandlerForward(const String &rid, const String &method,
-                               const String &path) {
+static void _shHandlerForward(const String &rid, const String &method, const String &path) {
+  _tunType = _TUN_DEFAULT_TYPE;
   String body = _sh.handler(method, path);
-  int code = body.length() ? 200 : 404;
-  if (!body.length()) body = "Not Found";
-  _wsSendResponse(rid, code, body, "text/html; charset=utf-8");
-  if (_tunAutoLog) _TUN_LOG(_sh.lastIP.c_str(), method.c_str(), path.c_str(), code);
+  int code = 200;
+  if (!body.length()) { code = 404; body = "Not Found"; }   // no copy: body may be most of the heap
+  _shRespond(rid, code, body, _tunType);
+  _tunLog(_sh.lastIP, method, path, code);
 }
 
-// =========================================================================
-// MARK: Parse option — "host:port/device-id"
-// =========================================================================
-
-static void _shParseOption() {
-  const char *s = _sh.option.c_str();
-  // MARK: Auto-detect TLS from URL scheme
-  if (strncmp(s, "https://", 8) == 0) { _sh.useTLS = true; s += 8; }
-  else if (strncmp(s, "http://", 7) == 0) { _sh.useTLS = false; s += 7; }
-  else { _sh.useTLS = false; }
-
-  const char *slash = strchr(s, '/');
-  const char *colon = strchr(s, ':');
-  int hostEnd = slash ? (int)(slash - s) : (int)strlen(s);
-  if (colon && colon < s + hostEnd) {
-    int hLen = (int)(colon - s);
-    char hBuf[128]; if (hLen >= (int)sizeof(hBuf)) hLen = sizeof(hBuf) - 1;
-    memcpy(hBuf, s, hLen); hBuf[hLen] = 0;
-    _sh.host = hBuf;
-    _sh.shPort = atoi(colon + 1);
-  } else {
-    char hBuf[128]; int hLen = hostEnd; if (hLen >= (int)sizeof(hBuf)) hLen = sizeof(hBuf) - 1;
-    memcpy(hBuf, s, hLen); hBuf[hLen] = 0;
-    _sh.host = hBuf;
-    _sh.shPort = _sh.useTLS ? 443 : 80;
-  }
-  _sh.id = slash ? String(slash + 1) : "esp32";
-  _sh.option = "";
-}
-
-// =========================================================================
-// MARK: Init + serve
-// =========================================================================
-
-static bool _shInit() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-
-  // MARK: mDNS — advertise http://<id>.local for direct LAN access (once)
-#if TUN_MDNS
-  static bool _mdnsUp = false;
-  if (!_mdnsUp && MDNS.begin(_sh.id.c_str())) {
-    MDNS.addService("http", "tcp", TUN_PORT);
-    _mdnsUp = true;
-  }
-#endif
-
-  // MARK: NTP time sync — once only, skip if RTC already valid
-  if (_sh.useTLS) {
-    time_t now = 0;
-    time(&now);
-    if (now < 100000) {
-      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-      unsigned long t0 = millis();
-      while (now < 100000 && millis() - t0 < 5000) {
-        time(&now);
-        _DELAY(100);
-      }
-    }
-  }
-
-  if (!_wsConnect()) return false;
-
-  // MARK: Send route config if any routes defined
-  if (_tunRouteCount > 0) {
-    String cfg = "{\"type\":\"config\",\"routes\":[";
-    for (int i = 0; i < _tunRouteCount; i++) {
-      if (i > 0) cfg += ",";
-      cfg += "{\"path\":\""; cfg += _tunRoutes[i].path; cfg += "\"";
-      if (_tunRoutes[i].password) {
-        cfg += ",\"password\":\""; cfg += _tunRoutes[i].password; cfg += "\"";
-      }
-      cfg += "}";
-    }
-    cfg += "]}";
-    int cfgLen = cfg.length();
-    if (_wsBeginFrame(cfgLen)) {
-      _sh.ws->write((const uint8_t*)cfg.c_str(), cfgLen);
-      _sh.ws->flush();
-    }
-  }
-
-  _sh.url = _sh.useTLS ? "https://" : "http://";
-  _sh.url += _sh.host;
-  if (_sh.shPort != (_sh.useTLS ? 443 : 80)) {
-    _sh.url += ":"; _sh.url += _sh.shPort;
-  }
-  _sh.url += "/";
-  _sh.url += _sh.id;
-  _sh.ready = true;
-  return true;
-}
-
-// MARK: Single-pass request parse — avoids 4× _jStr full scans
-static void _shParseMsg(const String &j, String &rid, String &method,
-                        String &path, String &ip) {
-  const char *s = j.c_str();
-  int len = j.length(), found = 0;
-  const char *keys[] = {"id", "method", "path", "ip"};
-  const int klens[] = {2, 6, 4, 2};
-  String *vals[] = {&rid, &method, &path, &ip};
-  for (int i = 0; i < len && found < 4; i++) {
-    if (s[i] != '"') continue;
-    for (int k = 0; k < 4; k++) {
-      if (vals[k]->length()) continue;
-      if (i + klens[k] + 2 > len) continue;
-      if (memcmp(s + i + 1, keys[k], klens[k]) || s[i + 1 + klens[k]] != '"') continue;
-      int vi = i + klens[k] + 2;
-      while (vi < len && (s[vi] == ':' || s[vi] == ' ')) vi++;
-      if (vi >= len || s[vi] != '"') break;
-      vi++;
-      char buf[128]; int p = 0;
-      while (vi < len && s[vi] != '"') {
-        char c;
-        if (s[vi] == '\\' && vi + 1 < len) {
-          char e = s[++vi]; c = (e=='n')?'\n':(e=='r')?'\r':(e=='t')?'\t':e;
-        } else c = s[vi];
-        if (p < 127) buf[p++] = c;
-        vi++;
-      }
-      buf[p] = 0; *vals[k] = String(buf);
-      i = vi; found++;
-      break;
-    }
-  }
-}
-
-static unsigned long _shLastPing = 0;
-
-static bool _shServe() {
-  if (!_sh.ws->connected()) return false;
-
-  // MARK: Periodic WS ping — keeps connection alive through proxies
-  if (millis() - _shLastPing > 25000) {
-    _shLastPing = millis();
-    uint8_t ping[6] = {0x89, 0x80, 0, 0, 0, 0};
-    _sh.ws->write(ping, 6);
-  }
-
-  String msg = _wsRecv();
-  if (!msg.length()) return _sh.ws->connected();
-
-  String rid, method, path, ip;
-  _shParseMsg(msg, rid, method, path, ip);
-  if (!rid.length() || !method.length()) return true;
+static void _shRequest(const String &msg) {
+  String rid = _jStr(msg, "id"), method = _jStr(msg, "method");
+  String path = _jStr(msg, "path"), ip = _jStr(msg, "ip");
+  if (!rid.length() || !method.length()) return;
   if (!path.length()) path = "/";
-  if (path.indexOf("..") >= 0) { _wsSendError(rid, 400, "Bad path"); return true; }
+  if (path.indexOf("..") >= 0) return _shRespond(rid, 400, "Bad path", "text/plain");
   String body, ct;
   if (method == "POST" || method == "PUT" || method == "PATCH") {
     body = _jStr(msg, "body");
     ct   = _jStr(msg, "ct");
   }
   _sh.lastIP = ip;
-
   if (_sh.handler) _shHandlerForward(rid, method, path);
   else             _shLocalForward(rid, method, path, ip, body, ct, msg);
+}
+
+// MARK: Connect + serve
+
+// "https://host:port/device-id" — scheme picks TLS, port defaults to 443/80, id to "esp32"
+static void _shParseOption(String s) {
+  _sh.useTLS = s.startsWith("https://");
+  if (s.indexOf("://") >= 0) s = s.substring(s.indexOf("://") + 3);
+  int slash = s.indexOf('/');
+  String hostPort = slash < 0 ? s : s.substring(0, slash);
+  _sh.id = slash < 0 ? String("esp32") : s.substring(slash + 1);
+  int colon = hostPort.indexOf(':');
+  _sh.host = colon < 0 ? hostPort : hostPort.substring(0, colon);
+  _sh.shPort = colon < 0 ? (_sh.useTLS ? 443 : 80) : hostPort.substring(colon + 1).toInt();
+}
+
+static bool _shConnect() {
+  if (_sh.useTLS && !_shWsTLS) { _shWsTLS = new WiFiClientSecure(); _shWsTLS->setInsecure(); }
+  _sh.ws = _sh.useTLS ? _shWsTLS : &_shWsPlain;
+  if (!_tcpConnectHost(*_sh.ws, _sh.host.c_str(), _sh.shPort)) return false;
+  // The key rides on the handshake so the relay can reject id hijacks.
+  String q = "?id=" + _sh.id + "&max=" + String(_MAX_BODY_SIZE);
+  if (_tunKey.length()) q += "&token=" + _tunKey;
+  _sh.ws->printf("GET %s%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                 TUN_WS_PATH, q.c_str(), _sh.host.c_str());
+  char line[128];
+  _readLineBuf(*_sh.ws, line, sizeof line, _CONNECT_MS);
+  if (!strstr(line, " 101")) { _sh.ws->stop(); return false; }
+  while (_readLineBuf(*_sh.ws, line, sizeof line, _DRAIN_TIMEOUT) > 0) {}
+  _setKeepAlive(*_sh.ws);
+  _shRx = "";
+  _shLastRx = _shLastPing = millis();
   return true;
 }
 
-// =========================================================================
-// MARK: Internal API (called by dispatch in esp32tunnel.h)
-// =========================================================================
+static bool _shInit() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+#if TUN_MDNS
+  static bool mdnsUp = false;           // http://<id>.local for direct LAN access
+  if (!mdnsUp && MDNS.begin(_sh.id.c_str())) { MDNS.addService("http", "tcp", TUN_PORT); mdnsUp = true; }
+#endif
+  if (_sh.useTLS && time(nullptr) < 100000) {   // TLS needs a sane clock; sync once
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    for (unsigned long t0 = millis(); time(nullptr) < 100000 && millis() - t0 < 5000;) _DELAY(100);
+  }
+  if (!_shConnect()) return false;
+
+  if (_tunRouteCount > 0) {             // per-route passwords, sent once
+    String cfg = "{\"type\":\"config\",\"routes\":[";
+    for (int i = 0; i < _tunRouteCount; i++) {
+      if (i) cfg += ",";
+      cfg += "{\"path\":\"" + String(_tunRoutes[i].path) + "\"";
+      if (_tunRoutes[i].password) cfg += ",\"password\":\"" + String(_tunRoutes[i].password) + "\"";
+      cfg += "}";
+    }
+    cfg += "]}";
+    if (!(_shFrame(0x1, cfg.length()) && _shSend((const uint8_t *)cfg.c_str(), cfg.length()))) return false;
+  }
+
+  _sh.url = String(_sh.useTLS ? "https://" : "http://") + _sh.host;
+  if (_sh.shPort != (_sh.useTLS ? 443 : 80)) _sh.url += ":" + String(_sh.shPort);
+  _sh.url += "/" + _sh.id;
+  _sh.ready = true;
+  return true;
+}
+
+static bool _shServe() {
+  if (!_sh.ws->available()) _shWait(false, 10);   // the task sleeps here until relay data
+  // Relay pings every 20 s and pongs ours, so 60 s of silence = dead link.
+  if (!_shPump() || millis() - _shLastRx > 60000) return false;
+  if (millis() - _shLastPing > 25000) {
+    _shLastPing = millis();
+    if (!_shFrame(0x9, 0)) return false;
+  }
+  uint8_t op; String msg;
+  while (_shFrameIn(op, msg)) {
+    if (op == 0x8) return false;                  // relay closed
+    if (op == 0x9 && !(_shFrame(0xA, msg.length()) && _shSend((const uint8_t *)msg.c_str(), msg.length())))
+      return false;
+    if (op == 0x1) _shRequest(msg);
+  }
+  return true;
+}
+
+// MARK: Internal API (dispatched from esp32tunnel.h)
 
 static void _shBegin(TunnelHandler handler, const char *server) {
   if (_sh.started) return;
   _sh.handler = handler;
-  _sh.option  = server ? server : "";
-  _sh.stop    = false;
-  _sh.ready   = false;
-  _sh.started = true;
-  _sh.url     = "(connecting...)";
-  _sh.phase   = _PH_INIT;
-  _sh.ws      = &_shWsPlain;
-  _shParseOption();
+  _sh.ws = &_shWsPlain;
+  _tunBegin(_sh);
+  _shParseOption(server ? server : "");
 }
 
-static unsigned long _shBackoff = 1000;
+static void _shDrop() { _sh.ws->stop(); }
 
-static void _shLoop() {
-  if (!_sh.started || _sh.stop) return;
-  switch (_sh.phase) {
-    case _PH_IDLE: break;
-    case _PH_INIT:
-      if (_shInit()) { _sh.phase = _PH_SERVE; _shBackoff = 1000; }
-      else { _sh.phase = _PH_WAIT; _sh.waitUntil = millis() + _shBackoff; _shBackoff = min(_shBackoff * 2, 60000UL); }
-      break;
-    case _PH_SERVE:
-      if (!_shServe()) {
-        _sh.ws->stop(); _sh.ready = false;
-        if (!TUN_RECONNECT) { _sh.phase = _PH_IDLE; _sh.started = false; }
-        else { _sh.phase = _PH_WAIT; _sh.waitUntil = millis() + _shBackoff; _shBackoff = min(_shBackoff * 2, 60000UL); }
-      }
-      break;
-    case _PH_WAIT:
-      if (millis() >= _sh.waitUntil) _sh.phase = _PH_INIT;
-      break;
-  }
-}
+static void _shLoop() { _tunStep(_sh, 1000, 60000, _shInit, _shServe, _shDrop); }
 
 static void _shStop() {
-  _sh.stop = true;
-  if (_sh.ws) _sh.ws->stop();
-  if (_sh.useTLS && _shWsTLS) {
-    delete _shWsTLS;
-    _shWsTLS = nullptr;
-  }
-  _sh.ws      = &_shWsPlain;
-  _sh.useTLS  = false;
-  _sh.ready   = false;
-  _sh.started = false;
-  _sh.phase   = _PH_IDLE;
-  _sh.url     = "(stopped)";
+  _sh.ws->stop();
+  if (_shWsTLS) { delete _shWsTLS; _shWsTLS = nullptr; }
+  _sh.ws = &_shWsPlain;
+  _sh.useTLS = false;
+  _tunEnd(_sh);
 }
 
 #endif
