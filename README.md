@@ -4,313 +4,161 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/HamzaYslmn/esp32-tunnel?style=social)](https://github.com/HamzaYslmn/esp32-tunnel)
 
-Expose your ESP32 web server to the public internet — no port forwarding, no ngrok, no cloud accounts, no companion devices.
+Put your ESP32 web server on the internet. No port forwarding, no router setup, no account.
+Your sketch stays a normal web server; one line opens a public link to it.
 
-Five providers (pick one):
-- **Self-hosted** (default) — plain WebSocket relay, no TLS on ESP32, saves ~40 KB RAM
-- **[localtunnel](https://localtunnel.me)** — free HTTPS subdomain URLs (uses WiFiClientSecure)
-- **[bore](https://github.com/ekzhang/bore)** — free TCP tunnel via bore.pub (no login, no account, no TLS)
-- **[openport.pw](https://openport.pw)** — free *permanent* TCP port, no account, any page size (ESP32)
-- **[tunnelmole](https://tunnelmole.com)** — free random HTTPS link, no account (ESP32)
+## Install
 
-## Features
+Arduino IDE → **Sketch → Include Library → Manage Libraries** → search **esp32-tunnel** → Install.
+(ESP Async WebServer and AsyncTCP are installed with it.)
 
-- **One API, five providers** — `tunnelSetup(SELFHOST | LOCALTUNNEL | BORE | OPENPORT | TUNNELMOLE, ...)`
-- **Secure by default** — auto-generated per-device access key (self-hosted)
-- **Runs itself** — a FreeRTOS task drives the tunnel; `loop()` stays free (ESP32)
-- **ESPAsyncWebServer compatible** — or handler mode for direct, no-proxy handling
-- **Local + remote** — reach the device at `http://<id>.local` (mDNS) or the public URL
-- **Auto-reconnect** — WiFi drops, stale connections, tunnel expiry all handled
-- **Lean** — self-hosted uses plain WiFiClient (no TLS), ~40 KB less RAM
-
-## Footprint & trimming (ESP32)
-
-Measured with arduino-cli. The library's own code is small — most of the flash is
-WiFi + TLS (the `https` relay) + your web server, not the tunnel.
-
-| Config | Flash | Trim |
-|---|---|---|
-| Relay + local web server + mDNS (typical) | ~1108 KB | — |
-| Handler mode + `#define TUN_MDNS 0` | ~1037 KB | **−71 KB** |
-
-- **Leave out providers you don't use** — `#define` before the include (or `-D` build flags).
-  Measured on the SelfHosted example (1,101,930 B with everything in):
-
-  | Flag | Saves |
-  |---|---|
-  | `TUN_NO_LOCALTUNNEL` | 5.1 KB |
-  | `TUN_NO_OPENPORT` | 3.7 KB |
-  | `TUN_NO_TUNNELMOLE` | 3.0 KB |
-  | `TUN_NO_BORE` | 1.9 KB |
-  | all four (self-hosted only) | **14.5 KB** |
-
-  Self-hosted is always built in. Calling `tunnelSetup()` with a left-out provider does nothing.
-- **Drop the local web server** — use handler mode (`tunnelSetup(SELFHOST, handler, "host/id")`); no `ESPAsyncWebServer`, saves its flash **and** its runtime `AsyncTCP` task/buffers.
-- **`#define TUN_MDNS 0`** before the include — drops mDNS (~30 KB) if you don't need `<id>.local`.
-- **`#define TUN_TASK_STACK 6144`** — trims the background-task stack (RAM). Keep ≥8 KB if your relay is `https` (TLS needs the headroom).
-- **CPU** is a non-issue — the self-hosted task sleeps in `select()` until the relay sends something.
-- **`#define TUN_MAX_BODY 32768`** — largest request/response body (default 16 KB). One body is buffered
-  in RAM, and an Arduino `String` caps at 65535 B without PSRAM, so ~64 KB is the ceiling. Bigger
-  replies get a clear `502 Response larger than TUN_MAX_BODY` instead of a truncated page.
-- **Wi-Fi modem sleep** slows replies a lot (measured: 1 KB took 11 s with sleep on, 64 ms off).
-  Call `WiFi.setSleep(false)` if latency matters more than power.
-
-## Dependencies
-
-Automatically installed:
-- **[ESP Async WebServer](https://github.com/ESP32Async/ESPAsyncWebServer)** + **AsyncTCP** — the local web server the examples use (not needed in handler mode)
-
-## Installation
-
-### Arduino Library Manager
-
-1. Open Arduino IDE
-2. **Sketch → Include Library → Manage Libraries**
-3. Search for **"esp32-tunnel"**
-4. Click **Install**
-
-### Manual
-
-Download ZIP → **Sketch → Include Library → Add .ZIP Library**
-
-## Quick Start
+## Quick start
 
 ```cpp
 #include <ESPAsyncWebServer.h>
 #include <esp32tunnel.h>
-#include <esp32tunnel_testpage.h>
 
 AsyncWebServer server(80);
 
 void setup() {
   Serial.begin(115200);
-  WiFi.begin("SSID", "PASS");
+  WiFi.setSleep(false);                        // much faster replies through the tunnel
+  WiFi.begin("YOUR_SSID", "YOUR_PASS");
   while (WiFi.status() != WL_CONNECTED) delay(500);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "text/html", TUN_TEST_HTML);
+    r->send(200, "text/html", "<h1>Hello from ESP32</h1>");
   });
   server.begin();
 
-  tunnelSetup(SELFHOST, "myserver.com/my-device");
+  tunnelSetup(SELFHOST, "https://esp32-tunnel-waa0.onrender.com/my-device");   // pick a unique id
 }
 
-void loop() {}   // ESP32: tunnel runs in its own task — loop() is free
+void loop() {
+  static bool shown = false;
+  if (!shown && tunnelReady()) {               // the tunnel runs in its own task; loop() is yours
+    shown = true;
+    Serial.printf("Open: %s/?key=%s\n", tunnelURL().c_str(), tunnelKey());
+  }
+}
 ```
 
-Switch provider by changing one line:
+Open the printed link from anywhere. On the same WiFi, `http://my-device.local/` reaches the
+device directly (faster, no key).
+
+## Pick a provider
+
+Change one line; everything else stays the same.
+
+| Provider | Call | Link you get | Typical reply* | Notes |
+|---|---|---|---|---|
+| **Self-hosted relay** | `tunnelSetup(SELFHOST, "https://host/id")` | `https://host/id/?key=…` | 250 ms | Private by default (access key). Free public relay, or [run your own](#run-your-own-relay) |
+| **OpenPort** | `tunnelSetup(OPENPORT)` | `http://openport.pw:PORT` | 190 ms | Same port every boot, any page size. ESP32 |
+| **Tunnelmole** | `tunnelSetup(TUNNELMOLE)` | `https://xxx.tunnelmole.net` | 900 ms | Random link, changes on reconnect. ESP32 |
+| **localtunnel** | `tunnelSetup(LOCALTUNNEL, "name")` | `https://name.loca.lt` | 0.7–1.3 s | Browsers see a loca.lt reminder page first |
+| **bore** | `tunnelSetup(BORE)` | `http://bore.pub:PORT` | ~1 s | Random port each boot. Some ISPs block bore.pub |
+
+\*Measured on an ESP32 over home WiFi. All are free and need no account. Only the self-hosted
+relay has an access key; with the others, anyone who has the link can open it.
+
+## Things to know
+
+- **Use relative links in your pages** (`href="status"`, `fetch("data")`, not `"/status"`).
+  On the relay your site lives under `/<device-id>/`, and a leading `/` points outside it.
+- **Access key (self-hosted).** Made once and kept in flash; `tunnelKey()` returns it. Visitors add
+  `?key=<key>` (or send an `X-Tunnel-Key` header). Change it with
+  `tunnelSetup(SELFHOST, url, "my-secret")`, or remove it with `tunnelPublic()` before `tunnelSetup()`.
+- **Page size.** Self-hosted, Tunnelmole and handler mode hold one reply in RAM, up to `TUN_MAX_BODY`
+  (16 KB default, 64 KB max without PSRAM). Bigger replies get a clear `502`. OpenPort, bore and
+  localtunnel stream, so any size works.
+- **`WiFi.setSleep(false)`** — with WiFi power saving on, replies slow down a lot
+  (measured: 1 KB took 11 s with it on, 64 ms off).
+- **Text only through the self-hosted relay** (HTML, CSS, JS, JSON, SVG).
+  For images and other binary files use OpenPort, bore or localtunnel.
+
+## Handler mode (no web server)
+
+Skip ESPAsyncWebServer and answer requests in a function. About 40 KB less flash (measured:
+HandlerMode vs SelfHosted example).
 
 ```cpp
-tunnelSetup(SELFHOST, "myserver.com/my-device");  // self-hosted relay
-tunnelSetup(LOCALTUNNEL, "my-esp32");             // free HTTPS via loca.lt
-tunnelSetup(BORE);                                 // free TCP via bore.pub
-tunnelSetup(OPENPORT);                             // free permanent port via openport.pw
-tunnelSetup(TUNNELMOLE);                           // free HTTPS via tunnelmole
+String handler(const String &method, const String &path) {
+  if (path == "/") return "<h1>Hello</h1>";
+  if (path == "/data") { tunnelContentType("application/json"); return "{\"t\":21.5}"; }
+  return "";                                   // 404
+}
+
+tunnelSetup(SELFHOST, handler, "https://esp32-tunnel-waa0.onrender.com/my-device");
+// also: tunnelSetup(TUNNELMOLE, handler, nullptr);
 ```
 
-> **ESP32:** `tunnelSetup()` starts a background FreeRTOS task, so you do **not**
-> call `tunnelLoop()`. Leave `loop()` empty, use it for your own code, or
-> `vTaskDelete(NULL)` to reclaim its stack. Enable request logs with `tunnelLog()`.
-> Tune the task with `-DTUN_TASK_CORE=0 -DTUN_TASK_PRIO=3 -DTUN_TASK_STACK=10240`. Keep the priority
-> above `loopTask` (1): at equal priority a busy `loop()` wedged the tunnel socket (default is 2).
->
-> **ESP8266** has no such task — there you must call `tunnelLoop()` in `loop()`.
+Serve files from flash with the optional headers:
+
+```cpp
+#include <esp32tunnel_progmem.h>   // tunnelProgmem(INDEX_HTML, "text/html")
+#include <esp32tunnel_littlefs.h>  // tunnelFile(path)  — from LittleFS, "/" → index.html
+```
 
 ## API
 
-All providers expose the same public API:
-
-| Function | Description |
+| Function | What it does |
 |---|---|
-| `tunnelSetup(...)` | Start tunnel (args differ per provider). ESP32: spawns the task |
-| `tunnelLog(bool)` | Enable/disable request logging |
-| `tunnelPublic()` | Disable auth — open access (call before `tunnelSetup`) |
-| `tunnelKey()` | The device's access key (`""` if public) |
-| `tunnelLocalURL()` | Direct LAN URL `http://<id>.local` (mDNS) |
-| `tunnelLoop()` | ESP8266 only — drive tunnel in `loop()`. No-op once the ESP32 task runs |
-| `tunnelStop()` | Stop tunnel, end the task, free resources |
-| `tunnelURL()` | Public URL or `"(connecting...)"` |
-| `tunnelReady()` | `true` when tunnel is live |
-| `tunnelLastIP()` | Last requester's IP address |
-| `tunnelProviderName()` | `"self-hosted"`, `"localtunnel"`, `"bore"`, `"openport"`, `"tunnelmole"` |
-| `tunnelContentType(t)` | Handler mode: set this response's Content-Type (default `text/html`) |
+| `tunnelSetup(provider, ...)` | Start the tunnel (see the provider table) |
+| `tunnelReady()` / `tunnelURL()` | Is it live? / the public link |
+| `tunnelKey()` | Self-hosted access key (`""` if public) |
+| `tunnelPublic()` | No access key — call before `tunnelSetup()` |
+| `tunnelLocalURL()` | `http://<id>.local` for the same WiFi |
+| `tunnelLog()` | Print every request to Serial |
+| `tunnelContentType(type)` | Handler mode: Content-Type of this reply |
+| `tunnelLastIP()` | IP of the last visitor |
+| `tunnelProviderName()` | `"self-hosted"`, `"openport"`, `"tunnelmole"`, `"localtunnel"`, `"bore"` |
+| `tunnelCACert(pem)` | Self-hosted: verify the relay's TLS certificate |
+| `tunnelStop()` | Close the tunnel |
+| `tunnelLoop()` | ESP8266 only — call in `loop()`. On ESP32 the tunnel runs itself |
 
-### Self-hosted `tunnelSetup()`
+## Options
 
-```cpp
-tunnelSetup(SELFHOST, "host/device-id");           // proxy mode (local port 80)
-tunnelSetup(SELFHOST, handler, "host/device-id");  // handler callback (no proxy)
-tunnelSetup(SELFHOST, "host/device-id", "pass");   // custom password (whole tunnel)
-tunnelSetup(SELFHOST, "host/device-id", routes);   // per-route auth
-tunnelPublic();                                    // before setup: OPEN access (no key)
-```
+`#define` before `#include <esp32tunnel.h>`, or pass as `-D` build flags.
 
-#### Access paths — local or public, your choice
+| Option | Default | What it does |
+|---|---|---|
+| `TUN_MAX_BODY` | `16384` | Largest reply in bytes for self-hosted/Tunnelmole/handler mode (max 65535 without PSRAM) |
+| `TUN_PORT` | `80` | Port of your local web server |
+| `TUN_MDNS` | `1` | `0` drops `<id>.local` (~30 KB flash) |
+| `TUN_NO_LOCALTUNNEL` | — | Leave localtunnel out (saves 5.1 KB) |
+| `TUN_NO_OPENPORT` | — | Leave OpenPort out (3.7 KB) |
+| `TUN_NO_TUNNELMOLE` | — | Leave Tunnelmole out (3.0 KB) |
+| `TUN_NO_BORE` | — | Leave bore out (1.9 KB). All four: 14.5 KB |
+| `TUN_TASK_CORE` / `TUN_TASK_PRIO` / `TUN_TASK_STACK` | `1` / `2` / `8192` | Tunnel task. Keep the priority above 1 (`loop()`'s), or a busy `loop()` stalls the tunnel |
 
-| Path | URL | Latency | Needs |
-|---|---|---|---|
-| **Local (direct)** | `http://<id>.local/` or the LAN IP | ~5 ms | same WiFi |
-| **Public (WS relay)** | `https://server/<id>?key=<key>` | ~200 ms | works anywhere |
+## Run your own relay
 
-On the same network, skip the tunnel entirely — the device serves its own pages at
-`http://<id>.local/` (mDNS, on by default; `tunnelLocalURL()`) or its LAN IP. The
-tunnel is only for reaching it from outside. The dashboard exposes both as tabs.
-
-#### Access keys (secure by default)
-
-Self-hosted devices are **private by default** — the ESP32 generates a random key on
-first boot (persisted in NVS, read via `tunnelKey()`). Send it as `?key=<key>` or the
-`X-Tunnel-Key` header (the dashboard does this for you). Set your own via
-the password overload above, or call `tunnelPublic()` to disable auth. Direct LAN
-access hits the device's own server and isn't gated by the key.
-
-### Localtunnel `tunnelSetup()`
-
-```cpp
-tunnelSetup(LOCALTUNNEL);                            // random subdomain
-tunnelSetup(LOCALTUNNEL, "my-esp32");                // custom subdomain
-tunnelSetup(LOCALTUNNEL, "my-esp32", TUN_STRICT);    // fail if subdomain is taken
-tunnelSetup(LOCALTUNNEL, handler, "my-esp32");       // handler callback
-```
-
-### Bore `tunnelSetup()`
-
-```cpp
-tunnelSetup(BORE);                                   // bore.pub, random port
-tunnelSetup(BORE, "your-server.com");                // self-hosted bore server
-```
-
-### OpenPort and Tunnelmole `tunnelSetup()` (ESP32)
-
-```cpp
-tunnelSetup(OPENPORT);                               // http://openport.pw:PORT, same port every boot
-tunnelSetup(TUNNELMOLE);                             // https://<random>.tunnelmole.net
-tunnelSetup(TUNNELMOLE, handler, nullptr);           // tunnelmole + handler mode
-```
-
-OpenPort registers once (3 registrations per IP per hour) and keeps its id + token in NVS.
-Some ISPs filter tunnel domains; if `bore.pub` shows a block page, the tunnel itself still works by IP.
-
-### Optional modules (handler mode)
-
-Handler mode has no web server, so these opt-in headers serve assets directly.
-In proxy mode you don't need them: ESPAsyncWebServer's `serveStatic()` / `send()` already does it.
-
-```cpp
-#include <esp32tunnel_progmem.h>   // tunnelProgmem(data, type) — PROGMEM string
-#include <esp32tunnel_littlefs.h>  // tunnelFile(path[, fs])   — file from LittleFS (or any fs::FS)
-
-const char INDEX_HTML[] PROGMEM = "<h1>Hello</h1>";
-
-String handler(const String &method, const String &path) {
-  if (path == "/")    return tunnelProgmem(INDEX_HTML, "text/html");
-  if (path == "/api") { tunnelContentType("application/json"); return "{\"ok\":1}"; }
-  return tunnelFile(path);         // "/" + "/dir/" -> index.html; "" = 404
-}
-```
-
-Text assets only (html/css/js/json/svg/txt), up to `TUN_MAX_BODY` per response.
-
-## Providers
-
-| | Self-hosted | localtunnel | bore | openport | tunnelmole |
-|---|---|---|---|---|---|
-| Enum | `SELFHOST` | `LOCALTUNNEL` | `BORE` | `OPENPORT` | `TUNNELMOLE` |
-| TLS on ESP32 | optional (`https://` URL) | ✅ (WiFiClientSecure) | ❌ (plain TCP) | API calls only | ✅ (WSS) |
-| RAM usage | Low (~40 KB less) | Higher (TLS) | Low | Low | Higher (TLS) |
-| URL format | `http://host/device-id` | `https://xxx.loca.lt` | `http://bore.pub:PORT` | `http://openport.pw:PORT` | `https://xxx.tunnelmole.net` |
-| Protocol | WebSocket relay | TCP pool | TCP tunnel | rathole TCP | WebSocket JSON |
-| Custom name | ✅ path-based | ✅ subdomain | ❌ random port | ❌ fixed port per device | ❌ random |
-| Needs server | ✅ | ❌ | ❌ (bore.pub free) | ❌ | ❌ |
-| Account needed | ❌ | ❌ | ❌ | ❌ | ❌ |
-
-## Self-Hosted Server
-
-A free public server is available at `esp32-tunnel.onrender.com`.
-Pick a unique device ID:
-
-```cpp
-#include <esp32tunnel.h>
-
-void setup() {
-  // ...
-  tunnelSetup(SELFHOST, "esp32-tunnel.onrender.com/my-device");
-  // Visit: http://esp32-tunnel.onrender.com/my-device
-}
-```
-
-> **Note:** Prefix the server with `https://` (e.g. `"https://my-relay.onrender.com/my-device"`)
-> to connect over TLS (`wss://`). Without a scheme it uses plain `ws://` on port 80 — lighter
-> on RAM, but only for servers that accept plain WebSocket. Pin the server cert with `tunnelCACert(pem)`.
-
-### Deploy Your Own (Render.com)
+The relay is a small Python (FastAPI) server in [`python/`](python). It has a dashboard at `/`
+and a health check at `/api/status`.
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/HamzaYslmn/esp32-tunnel)
 
-Or manually:
+Or anywhere with Python 3.13+:
 
-1. Fork this repo on GitHub
-2. Go to [render.com](https://render.com) → **New Web Service**
-3. Connect your fork
-4. Configure:
-
-| Setting | Value |
-|---|---|
-| **Root Directory** | `python` |
-| **Environment** | Add `PORT` = `8000` |
-| **Build Command** | `pip install uv && uv sync --active` |
-| **Start Command** | `uv run --active main.py` |
-
-5. Deploy — your server will be at `your-app.onrender.com`
-
-The server provides:
-- **WebSocket tunnel** relay between visitors and ESP32
-- **Dashboard** at the root URL with live server stats
-- **Status API** at `/api/status` for health checks
-
-## Tuning
-
-Override **before** `#include`:
-
-```cpp
-#define TUN_POOL      2         // localtunnel pool size (default: 2)
-#define TUN_STALE     30000     // recycle connections after 30s
-#define TUN_REALLOC   12        // re-allocate tunnel every 12h
-#define TUN_LOG       0         // disable tunnel Serial logs
-#include <esp32tunnel.h>
+```bash
+cd python && uv run main.py          # listens on 0.0.0.0:8000
 ```
 
-## How It Works
-
-### Self-hosted
-```
-Browser → your-server (HTTPS) → WebSocket → ESP32 → JSON response → back
-```
-
-### localtunnel
-```
-Browser → loca.lt (HTTPS) → TCP pool → ESP32 → HTTP response → back
-```
-
-### bore
-```
-Browser → bore.pub:PORT (HTTP) → TCP tunnel → ESP32 localhost:80 → back
-```
+Then use `tunnelSetup(SELFHOST, "https://your-host/my-device")`. Use `https://` for TLS;
+without a scheme the ESP32 connects over plain `ws://` (less RAM, for LAN or trusted servers).
 
 ## Examples
 
-| Example | Description |
+| Example | Shows |
 |---|---|
-| [SelfHosted](examples/SelfHosted) | Full-featured self-hosted relay (auth, TLS, handler) |
-| [Localtunnel](examples/Localtunnel) | Free HTTPS URL via localtunnel.me |
-| [Bore](examples/Bore) | Free TCP tunnel via bore.pub (no login) |
-| [HandlerMode](examples/HandlerMode) | Direct request handling (no AsyncWebServer) |
-| [DualCore](examples/DualCore) | ESP32 FreeRTOS task on dedicated core |
+| [SelfHosted](examples/SelfHosted) | Web server through the relay, access key, `.local` link |
+| [HandlerMode](examples/HandlerMode) | No web server — a function answers requests |
+| [DualCore](examples/DualCore) | `loop()` keeps working (a sensor) while the tunnel serves it |
+| [OpenPort](examples/OpenPort) | Permanent free port via openport.pw |
+| [Tunnelmole](examples/Tunnelmole) | Free HTTPS link via tunnelmole.com |
+| [Localtunnel](examples/Localtunnel) | Free HTTPS link via loca.lt |
+| [Bore](examples/Bore) | Free TCP port via bore.pub |
 
 ## License
 
-MIT
-
-## Author
-
-**Hamza Yesilmen** — [@HamzaYslmn](https://github.com/HamzaYslmn)
+MIT — **Hamza Yesilmen** ([@HamzaYslmn](https://github.com/HamzaYslmn))

@@ -4,7 +4,7 @@
  * Instead of running ESPAsyncWebServer, give tunnelSetup() a handler:
  *   String handler(const String &method, const String &path)
  * It gets every request's method and path (with ?query), and returns the
- * response body. Return "" for 404. Lighter: no web server, ~70 KB less flash.
+ * response body. Return "" for 404. Lighter: no web server, ~40 KB less flash.
  *
  * Content type defaults to text/html; call tunnelContentType() inside the
  * handler to change it for that reply.
