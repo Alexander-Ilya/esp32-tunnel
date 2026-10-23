@@ -6,14 +6,16 @@
 
 Expose your ESP32 web server to the public internet — no port forwarding, no ngrok, no cloud accounts, no companion devices.
 
-Three providers (pick one):
+Five providers (pick one):
 - **Self-hosted** (default) — plain WebSocket relay, no TLS on ESP32, saves ~40 KB RAM
 - **[localtunnel](https://localtunnel.me)** — free HTTPS subdomain URLs (uses WiFiClientSecure)
 - **[bore](https://github.com/ekzhang/bore)** — free TCP tunnel via bore.pub (no login, no account, no TLS)
+- **[openport.pw](https://openport.pw)** — free *permanent* TCP port, no account, any page size (ESP32)
+- **[tunnelmole](https://tunnelmole.com)** — free random HTTPS link, no account (ESP32)
 
 ## Features
 
-- **One API, three providers** — `tunnelSetup(SELFHOST | LOCALTUNNEL | BORE, ...)`
+- **One API, five providers** — `tunnelSetup(SELFHOST | LOCALTUNNEL | BORE | OPENPORT | TUNNELMOLE, ...)`
 - **Secure by default** — auto-generated per-device access key (self-hosted)
 - **Runs itself** — a FreeRTOS task drives the tunnel; `loop()` stays free (ESP32)
 - **ESPAsyncWebServer compatible** — or handler mode for direct, no-proxy handling
@@ -90,6 +92,8 @@ Switch provider by changing one line:
 tunnelSetup(SELFHOST, "myserver.com/my-device");  // self-hosted relay
 tunnelSetup(LOCALTUNNEL, "my-esp32");             // free HTTPS via loca.lt
 tunnelSetup(BORE);                                 // free TCP via bore.pub
+tunnelSetup(OPENPORT);                             // free permanent port via openport.pw
+tunnelSetup(TUNNELMOLE);                           // free HTTPS via tunnelmole
 ```
 
 > **ESP32:** `tunnelSetup()` starts a background FreeRTOS task, so you do **not**
@@ -116,7 +120,7 @@ All providers expose the same public API:
 | `tunnelURL()` | Public URL or `"(connecting...)"` |
 | `tunnelReady()` | `true` when tunnel is live |
 | `tunnelLastIP()` | Last requester's IP address |
-| `tunnelProviderName()` | `"self-hosted"`, `"localtunnel"`, or `"bore"` |
+| `tunnelProviderName()` | `"self-hosted"`, `"localtunnel"`, `"bore"`, `"openport"`, `"tunnelmole"` |
 | `tunnelContentType(t)` | Handler mode: set this response's Content-Type (default `text/html`) |
 
 ### Self-hosted `tunnelSetup()`
@@ -164,6 +168,17 @@ tunnelSetup(BORE);                                   // bore.pub, random port
 tunnelSetup(BORE, "your-server.com");                // self-hosted bore server
 ```
 
+### OpenPort and Tunnelmole `tunnelSetup()` (ESP32)
+
+```cpp
+tunnelSetup(OPENPORT);                               // http://openport.pw:PORT, same port every boot
+tunnelSetup(TUNNELMOLE);                             // https://<random>.tunnelmole.net
+tunnelSetup(TUNNELMOLE, handler, nullptr);           // tunnelmole + handler mode
+```
+
+OpenPort registers once (3 registrations per IP per hour) and keeps its id + token in NVS.
+Some ISPs filter tunnel domains; if `bore.pub` shows a block page, the tunnel itself still works by IP.
+
 ### Optional modules (handler mode)
 
 Handler mode has no web server, so these opt-in headers serve assets directly.
@@ -186,16 +201,16 @@ Text assets only (html/css/js/json/svg/txt), up to `TUN_MAX_BODY` per response.
 
 ## Providers
 
-| | Self-hosted | localtunnel | bore |
-|---|---|---|---|
-| Enum | `SELFHOST` | `LOCALTUNNEL` | `BORE` |
-| TLS on ESP32 | optional (`https://` URL) | ✅ (WiFiClientSecure) | ❌ (plain TCP) |
-| RAM usage | Low (~40 KB less) | Higher (TLS) | Low |
-| URL format | `http://host/device-id` | `https://xxx.loca.lt` | `http://bore.pub:PORT` |
-| Protocol | WebSocket relay | TCP pool | TCP tunnel |
-| Custom name | ✅ path-based | ✅ subdomain | ❌ random port |
-| Needs server | ✅ | ❌ | ❌ (bore.pub free) |
-| Account needed | ❌ | ❌ | ❌ |
+| | Self-hosted | localtunnel | bore | openport | tunnelmole |
+|---|---|---|---|---|---|
+| Enum | `SELFHOST` | `LOCALTUNNEL` | `BORE` | `OPENPORT` | `TUNNELMOLE` |
+| TLS on ESP32 | optional (`https://` URL) | ✅ (WiFiClientSecure) | ❌ (plain TCP) | API calls only | ✅ (WSS) |
+| RAM usage | Low (~40 KB less) | Higher (TLS) | Low | Low | Higher (TLS) |
+| URL format | `http://host/device-id` | `https://xxx.loca.lt` | `http://bore.pub:PORT` | `http://openport.pw:PORT` | `https://xxx.tunnelmole.net` |
+| Protocol | WebSocket relay | TCP pool | TCP tunnel | rathole TCP | WebSocket JSON |
+| Custom name | ✅ path-based | ✅ subdomain | ❌ random port | ❌ fixed port per device | ❌ random |
+| Needs server | ✅ | ❌ | ❌ (bore.pub free) | ❌ | ❌ |
+| Account needed | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ## Self-Hosted Server
 

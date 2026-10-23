@@ -122,35 +122,31 @@ static void _shRespond(const String &rid, int code, const String &body, const St
 
 // MARK: Requests
 
-static void _shLocalForward(const String &rid, const String &method, const String &path,
-                            const String &ip, const String &reqBody, const String &ct,
-                            const String &rawMsg) {
-  if (_shLocal.connected()) _shLocal.stop();
-  if (!_openLocal(_shLocal, method, path, ip, reqBody, ct, rawMsg))
-    return _shRespond(rid, 502, "Local server unreachable", "text/plain");
-  if (!_waitLocal(_shLocal)) {
+// One reply from the sketch: its handler (handler mode) or its web server on TUN_PORT
+// (proxy mode). Shared by every WebSocket provider.
+static void _tunFetch(const String &method, const String &path, const String &ip,
+                      const String &reqBody, const String &ct, const String &rawMsg,
+                      int &code, String &body, String &type) {
+  if (_sh.handler) {
+    _tunType = _TUN_DEFAULT_TYPE;
+    body = _sh.handler(method, path);
+    code = 200; type = _tunType;
+    if (!body.length()) { code = 404; body = "Not Found"; }
+  } else {
+    code = 502; type = "text/plain";
+    if (_shLocal.connected()) _shLocal.stop();
+    if (!_openLocal(_shLocal, method, path, ip, reqBody, ct, rawMsg)) body = "Local server unreachable";
+    else if (!_waitLocal(_shLocal)) { code = 504; body = "Local timeout"; }
+    else {
+      int len;
+      _parseLocalResponse(_shLocal, code, type, len);
+      if (len > _MAX_BODY_SIZE) {         // say so instead of sending a truncated page
+        code = 502; type = "text/plain"; body = "Response larger than TUN_MAX_BODY";
+      } else body = _readLocalBody(_shLocal, len);
+    }
     _shLocal.stop();
-    return _shRespond(rid, 504, "Local timeout", "text/plain");
   }
-  int code, len; String type;
-  _parseLocalResponse(_shLocal, code, type, len);
-  if (len > _MAX_BODY_SIZE) {             // say so instead of sending a truncated page
-    _shLocal.stop();
-    return _shRespond(rid, 502, "Response larger than TUN_MAX_BODY", "text/plain");
-  }
-  String body = _readLocalBody(_shLocal, len);
-  _shLocal.stop();
-  _shRespond(rid, code, body, type);
   _tunLog(ip, method, path, code);
-}
-
-static void _shHandlerForward(const String &rid, const String &method, const String &path) {
-  _tunType = _TUN_DEFAULT_TYPE;
-  String body = _sh.handler(method, path);
-  int code = 200;
-  if (!body.length()) { code = 404; body = "Not Found"; }   // no copy: body may be most of the heap
-  _shRespond(rid, code, body, _tunType);
-  _tunLog(_sh.lastIP, method, path, code);
 }
 
 static void _shRequest(const String &msg) {
@@ -159,14 +155,15 @@ static void _shRequest(const String &msg) {
   if (!rid.length() || !method.length()) return;
   if (!path.length()) path = "/";
   if (path.indexOf("..") >= 0) return _shRespond(rid, 400, "Bad path", "text/plain");
-  String body, ct;
+  String reqBody, ct;
   if (method == "POST" || method == "PUT" || method == "PATCH") {
-    body = _jStr(msg, "body");
-    ct   = _jStr(msg, "ct");
+    reqBody = _jStr(msg, "body");
+    ct      = _jStr(msg, "ct");
   }
   _sh.lastIP = ip;
-  if (_sh.handler) _shHandlerForward(rid, method, path);
-  else             _shLocalForward(rid, method, path, ip, body, ct, msg);
+  int code; String body, type;
+  _tunFetch(method, path, ip, reqBody, ct, msg, code, body, type);
+  _shRespond(rid, code, body, type);
 }
 
 // MARK: Connect + serve
@@ -183,16 +180,15 @@ static void _shParseOption(String s) {
   _sh.shPort = colon < 0 ? (_sh.useTLS ? 443 : 80) : hostPort.substring(colon + 1).toInt();
 }
 
-static bool _shConnect() {
+static bool _shConnect(const String &path) {
   if (_sh.useTLS && !_shWsTLS) { _shWsTLS = new WiFiClientSecure(); _shWsTLS->setInsecure(); }
   _sh.ws = _sh.useTLS ? _shWsTLS : &_shWsPlain;
   if (!_tcpConnectHost(*_sh.ws, _sh.host.c_str(), _sh.shPort)) return false;
-  // The key rides on the handshake so the relay can reject id hijacks.
-  String q = "?id=" + _sh.id + "&max=" + String(_MAX_BODY_SIZE);
-  if (_tunKey.length()) q += "&token=" + _tunKey;
-  _sh.ws->printf("GET %s%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+  String host = _sh.host;
+  if (_sh.shPort != (_sh.useTLS ? 443 : 80)) host += ":" + String(_sh.shPort);
+  _sh.ws->printf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                  "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-                 TUN_WS_PATH, q.c_str(), _sh.host.c_str());
+                 path.c_str(), host.c_str());
   char line[128];
   _readLineBuf(*_sh.ws, line, sizeof line, _CONNECT_MS);
   if (!strstr(line, " 101")) { _sh.ws->stop(); return false; }
@@ -213,7 +209,10 @@ static bool _shInit() {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     for (unsigned long t0 = millis(); time(nullptr) < 100000 && millis() - t0 < 5000;) _DELAY(100);
   }
-  if (!_shConnect()) return false;
+  // The key rides on the handshake so the relay can reject id hijacks.
+  String q = String(TUN_WS_PATH) + "?id=" + _sh.id + "&max=" + String(_MAX_BODY_SIZE);
+  if (_tunKey.length()) q += "&token=" + _tunKey;
+  if (!_shConnect(q)) return false;
 
   if (_tunRouteCount > 0) {             // per-route passwords, sent once
     String cfg = "{\"type\":\"config\",\"routes\":[";
@@ -234,7 +233,8 @@ static bool _shInit() {
   return true;
 }
 
-static bool _shServe() {
+// One step of a WebSocket session: sleep until data, answer pings, hand text frames to onText.
+static bool _wsServe(void (*onText)(const String &)) {
   if (!_sh.ws->available()) _shWait(false, 10);   // the task sleeps here until relay data
   // Relay pings every 20 s and pongs ours, so 60 s of silence = dead link.
   if (!_shPump() || millis() - _shLastRx > 60000) return false;
@@ -247,10 +247,12 @@ static bool _shServe() {
     if (op == 0x8) return false;                  // relay closed
     if (op == 0x9 && !(_shFrame(0xA, msg.length()) && _shSend((const uint8_t *)msg.c_str(), msg.length())))
       return false;
-    if (op == 0x1) _shRequest(msg);
+    if (op == 0x1) onText(msg);
   }
   return true;
 }
+
+static bool _shServe() { return _wsServe(_shRequest); }
 
 // MARK: Internal API (dispatched from esp32tunnel.h)
 

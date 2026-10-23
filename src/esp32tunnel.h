@@ -9,6 +9,8 @@
  *   tunnelSetup(LOCALTUNNEL, "my-esp32");
  *   tunnelSetup(BORE);                                // bore.pub random port
  *   tunnelSetup(BORE, "my-server.com");               // self-hosted bore
+ *   tunnelSetup(OPENPORT);                            // openport.pw, same port every boot
+ *   tunnelSetup(TUNNELMOLE);                          // https://<random>.tunnelmole.net
  *
  * Handler-mode assets: #include <esp32tunnel_progmem.h> or <esp32tunnel_littlefs.h>
  * Tuning (before the include): TUN_MAX_BODY, TUN_TASK_PRIO, TUN_TASK_STACK, TUN_MDNS
@@ -56,7 +58,7 @@ static void _tunLog(const String &ip, const String &method, const String &path, 
 
 // MARK: Types & config
 
-enum TunnelProvider { SELFHOST, LOCALTUNNEL, BORE };
+enum TunnelProvider { SELFHOST, LOCALTUNNEL, BORE, OPENPORT, TUNNELMOLE };
 enum TunnelMode { TUN_STRICT, TUN_FLEX };
 
 typedef String (*TunnelHandler)(const String &method, const String &path);
@@ -81,18 +83,19 @@ static int _tunRouteCount = 0;
 static String _tunKey;            // "" = open access (insecure)
 static bool _tunAutoAuth = true;
 
-static String _tunMakeKey() {
+// 32 random hex chars, made once and kept in NVS under `name` ("" without NVS).
+static String _tunNvsRandom(const char *name) {
 #ifdef ESP32
   Preferences p;
   if (p.begin("esp32tunnel", false)) {
-    String k = p.getString("key", "");
+    String k = p.getString(name, "");
     if (k.length() < 24) {
       static const char hex[] = "0123456789abcdef";
       char buf[33];
       for (int i = 0; i < 32; i++) buf[i] = hex[esp_random() & 0xF];
       buf[32] = 0;
       k = buf;
-      p.putString("key", k);
+      p.putString(name, k);
     }
     p.end();
     return k;
@@ -100,6 +103,8 @@ static String _tunMakeKey() {
 #endif
   return "";   // ESP8266 / NVS unavailable: pass a password to tunnelSetup()
 }
+
+static String _tunMakeKey() { return _tunNvsRandom("key"); }
 
 #ifndef TUN_PORT
 #define TUN_PORT 80
@@ -226,8 +231,17 @@ static int _jInt(const String &j, const char *key, int def = 0) {
   return atoi(s);
 }
 
+// Visitor headers worth passing to the local server (the rest it sets itself).
+static bool _hdrForward(const char *k, int n) {
+  static const char *const keep[] = {"authorization", "cookie", "user-agent", "accept", "accept-language"};
+  for (auto h : keep) if ((int)strlen(h) == n && strncasecmp(k, h, n) == 0) return true;
+  return false;
+}
+
+// Copy the forwardable entries of the message's "hdrs" (relay) / "headers" (tunnelmole) object.
 static void _writeHdrs(WiFiClient &local, const String &msg) {
   int i = _jFind(msg, "hdrs");
+  if (i < 0) i = _jFind(msg, "headers");
   if (i < 0 || msg[i] != '{') return;
   i++;
   const char *s = msg.c_str();
@@ -244,7 +258,7 @@ static void _writeHdrs(WiFiClient &local, const String &msg) {
     i++; int vs = i;
     while (i < len && s[i] != '"') { if (s[i] == '\\' && i + 1 < len) i += 2; else i++; }
     int ve = i; i++;
-    if (ke > ks && ve > vs) {
+    if (ke > ks && ve > vs && _hdrForward(s + ks, ke - ks)) {
       local.write((const uint8_t*)(s + ks), ke - ks);
       local.write((const uint8_t*)": ", 2);
       local.write((const uint8_t*)(s + vs), ve - vs);
@@ -348,6 +362,24 @@ static String _readLocalBody(WiFiClient &local, int contentLen) {
   return body;
 }
 
+// Copy bytes both ways until a side closes with nothing left to move, or 30 s idle
+// (raw TCP providers). connected() goes false while bytes still sit in the client's
+// buffer, so drain before stopping — otherwise the end of a page is lost.
+static void _tunPipe(WiFiClient &remote, WiFiClient &local) {
+  uint8_t buf[512];
+  for (unsigned long idle = millis(); millis() - idle < 30000;) {
+    int n;
+    bool moved = false;
+    if (remote.available() && (n = remote.read(buf, sizeof buf)) > 0) { local.write(buf, n); moved = true; }
+    if (local.available() && (n = local.read(buf, sizeof buf)) > 0) { remote.write(buf, n); moved = true; }
+    if (moved) idle = millis();
+    else if (!remote.connected() || !local.connected()) break;
+    else _DELAY(1);
+  }
+  remote.stop();
+  local.stop();
+}
+
 // MARK: Provider state + reconnect loop
 
 struct _TunBase {
@@ -396,21 +428,35 @@ static void _tunStep(_TunBase &t, unsigned long base, unsigned long cap,
 #include "esp32tunnel_selfhosted.h"
 #include "esp32tunnel_localtunnel.h"
 #include "esp32tunnel_bore.h"
+#include "esp32tunnel_openport.h"     // ESP32 only
+#include "esp32tunnel_tunnelmole.h"   // ESP32 only
 
 static TunnelProvider _tunProvider = SELFHOST;
 
 static _TunBase &_tunCur() {
-  if (_tunProvider == SELFHOST) return _sh;
-  if (_tunProvider == BORE)     return _bore;
-  return _lt;
+  switch (_tunProvider) {
+    case LOCALTUNNEL: return _lt;
+    case BORE:        return _bore;
+#ifdef ESP32
+    case OPENPORT:    return _op;
+#endif
+    default:          return _sh;     // SELFHOST, TUNNELMOLE (same WebSocket session)
+  }
 }
 
 // MARK: Public API
 
 static inline void _tunService() {
-  if (_tunProvider == SELFHOST)      _shLoop();
-  else if (_tunProvider == BORE)     _boreLoop();
-  else                               _ltLoop();
+  switch (_tunProvider) {
+    case SELFHOST:    _shLoop(); break;
+    case LOCALTUNNEL: _ltLoop(); break;
+    case BORE:        _boreLoop(); break;
+#ifdef ESP32
+    case OPENPORT:    _opLoop(); break;
+    case TUNNELMOLE:  _tmLoop(); break;
+#endif
+    default: break;
+  }
 }
 
 // ESP32: a FreeRTOS task owns the tunnel, so the sketch's loop() stays free.
@@ -421,8 +467,9 @@ static volatile bool _tunTaskRun = false;
 static void _tunTaskFn(void *) {
   while (_tunTaskRun) {
     _tunService();
-    // A serving self-hosted tunnel already sleeps in select(); the rest poll every 10 ms.
-    if (!(_tunProvider == SELFHOST && _sh.ready)) vTaskDelay(pdMS_TO_TICKS(10));
+    // A serving WebSocket tunnel already sleeps in select(); the rest poll every 10 ms.
+    bool ws = _tunProvider == SELFHOST || _tunProvider == TUNNELMOLE;
+    if (!(ws && _sh.ready)) vTaskDelay(pdMS_TO_TICKS(10));
   }
   _tunTask = nullptr;
   vTaskDelete(nullptr);
@@ -441,9 +488,16 @@ inline void tunnelSetup(TunnelProvider p, TunnelHandler handler,
   _tunProvider = p;
   if (p == SELFHOST && !_tunKey.length() && _tunAutoAuth && !_tunRouteCount)
     _tunKey = _tunMakeKey();
-  if (p == SELFHOST)      _shBegin(handler, option);
-  else if (p == BORE)     _boreBegin(option, TUN_PORT);
-  else                    _ltBegin(handler, option, mode);
+  switch (p) {
+    case SELFHOST:    _shBegin(handler, option); break;
+    case LOCALTUNNEL: _ltBegin(handler, option, mode); break;
+    case BORE:        _boreBegin(option, TUN_PORT); break;     // raw TCP: needs a web server
+#ifdef ESP32
+    case OPENPORT:    _opBegin(); break;                       // raw TCP: needs a web server
+    case TUNNELMOLE:  _tmBegin(handler); break;
+#endif
+    default: break;
+  }
 #ifdef ESP32
   _tunStartTask();
 #endif
@@ -488,13 +542,13 @@ inline String tunnelLocalURL() {
 inline void tunnelLog(bool enable = true) { _tunAutoLog = enable; }
 
 // ESP8266 only — on ESP32 the task drives the tunnel and this is a no-op.
-inline void tunnelLoop(bool log = false) {
-  _tunAutoLog = log;
+inline void tunnelLoop() {
 #ifdef ESP32
   if (_tunTask) return;
 #endif
   _tunService();
 }
+inline void tunnelLoop(bool log) { _tunAutoLog = log; tunnelLoop(); }   // old form
 
 inline void tunnelStop() {
 #ifdef ESP32
@@ -504,9 +558,14 @@ inline void tunnelStop() {
     for (int i = 0; i < 200 && _tunTask; i++) _DELAY(5);
   }
 #endif
-  if (_tunProvider == SELFHOST)      _shStop();
-  else if (_tunProvider == BORE)     _boreStop();
-  else                               _ltStop();
+  switch (_tunProvider) {
+    case LOCALTUNNEL: _ltStop(); break;
+    case BORE:        _boreStop(); break;
+#ifdef ESP32
+    case OPENPORT:    _opStop(); break;
+#endif
+    default:          _shStop(); break;   // SELFHOST, TUNNELMOLE
+  }
 }
 
 inline String tunnelURL()    { return _tunCur().url; }
@@ -514,9 +573,8 @@ inline bool   tunnelReady()  { return _tunCur().ready; }
 inline String tunnelLastIP() { return _tunCur().lastIP; }
 
 inline const char* tunnelProviderName() {
-  if (_tunProvider == SELFHOST) return "self-hosted";
-  if (_tunProvider == BORE)     return "bore";
-  return "localtunnel";
+  static const char *const names[] = {"self-hosted", "localtunnel", "bore", "openport", "tunnelmole"};
+  return names[_tunProvider];
 }
 
 // Self-hosted only: verify the relay's TLS cert (nullptr/"" = don't verify).

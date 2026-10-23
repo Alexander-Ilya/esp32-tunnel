@@ -44,28 +44,13 @@ static void _boreSendMsg(WiFiClient &c, const String &msg) {
 
 // MARK: Proxy
 
-static void _boreProxyConn(WiFiClient &remote, WiFiClient &local) {
-  uint8_t buf[512];
-  unsigned long idle = millis();
-  while (remote.connected() && local.connected() && millis() - idle < 30000) {
-    bool activity = false;
-    int n;
-    if (remote.available() && (n = remote.read(buf, sizeof buf)) > 0) { local.write(buf, n); activity = true; }
-    if (local.available() && (n = local.read(buf, sizeof buf)) > 0) { remote.write(buf, n); activity = true; }
-    if (activity) idle = millis();
-    else _DELAY(1);
-  }
-  remote.stop();
-  local.stop();
-}
-
 static void _boreAccept(const String &uuid, int slot) {
   WiFiClient &proxy = _boreProxy[slot], &local = _boreLocal[slot];
   if (!_tcpConnectHost(proxy, _bore.host.c_str(), BORE_CONTROL_PORT)) return;
   _boreSendMsg(proxy, "{\"Accept\":\"" + uuid + "\"}");
   if (!_tcpConnect(local, IPAddress(127, 0, 0, 1), _bore.localPort)) { proxy.stop(); return; }
   local.setNoDelay(true);
-  _boreProxyConn(proxy, local);
+  _tunPipe(proxy, local);
 }
 
 // MARK: Init + serve
