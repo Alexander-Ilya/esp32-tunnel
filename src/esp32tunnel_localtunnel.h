@@ -166,7 +166,8 @@ static bool _ltAllocate() {
   if (!_tlsConnect(tls, "loca.lt", 443)) return false;
 
   String sub = _lt.option.length() ? _lt.option : ("esp32-" + _chipID());
-  tls.printf("GET /api/tunnels/%s/0 HTTP/1.1\r\nHost: loca.lt\r\nConnection: close\r\n\r\n", sub.c_str());
+  // Same endpoint the official client uses (the old /api/tunnels/<id>/0 now 404s)
+  tls.printf("GET /%s HTTP/1.1\r\nHost: loca.lt\r\nConnection: close\r\n\r\n", sub.c_str());
 
   unsigned long t0 = millis();
   while (!tls.available() && millis() - t0 < _CONNECT_MS) _DELAY(10);

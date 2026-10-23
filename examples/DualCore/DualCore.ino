@@ -1,71 +1,68 @@
 /*
- * DualCore.ino — Free main loop() while the tunnel runs itself (ESP32)
+ * DualCore — keep doing your own work in loop() while the tunnel serves it.
  *
- * On ESP32 the library runs the tunnel in its own FreeRTOS task
- * automatically — you do NOT call tunnelLoop() in loop(). Your loop()
- * is free for sensors, displays, motor control, etc.
+ * On ESP32 the tunnel runs in its own FreeRTOS task, so loop() is free for
+ * sensors, displays, motors... This sketch "reads a sensor" in loop() and
+ * the web page shows the latest value through the tunnel.
  *
- * Tune the tunnel task with build flags if needed:
- *   -DTUN_TASK_CORE=0   (default 1)   -DTUN_TASK_PRIO=2   -DTUN_TASK_STACK=10240
+ * Sharing data between loop() and web requests: they run in different tasks,
+ * so keep shared values small and simple (a volatile int/float is fine).
  *
- * Note: ESP8266 has no FreeRTOS task — there you must call tunnelLoop()
- * in loop() (see the Localtunnel/SelfHosted examples).
+ * Task tuning, if needed (build flags or #define before the include):
+ *   TUN_TASK_CORE  (default 1)   TUN_TASK_PRIO  (default 2, keep it above 1)
+ *   TUN_TASK_STACK (default 8192)
  *
  * Board: ESP32
  */
 
 #include <ESPAsyncWebServer.h>
 #include <esp32tunnel.h>
-#include <esp32tunnel_testpage.h>
-#include <espfetch.h>
-#include <rtosSerial.h>
 
+// ── Change these ─────────────────────────────────────────────
 const char *WIFI_SSID = "YOUR_SSID";
 const char *WIFI_PASS = "YOUR_PASS";
 const char *TUNNEL_SERVER = "https://esp32-tunnel-waa0.onrender.com/my-device";
+// ─────────────────────────────────────────────────────────────
 
 AsyncWebServer server(80);
 
+volatile float temperature = 0;   // written by loop(), read by the web server
+volatile unsigned long readings = 0;
+
 void setup() {
-  rtosSerial.begin(115200);
+  Serial.begin(115200);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  logger.info("Connecting to WiFi...");
   while (WiFi.status() != WL_CONNECTED) delay(500);
-  logger.info("WiFi: %s", WiFi.localIP().toString().c_str());
+  Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "text/html", TUN_TEST_HTML);
+    r->send(200, "text/html",
+      "<h1>Sensor</h1><p>" + String(temperature, 1) + " &deg;C after " + String(readings) +
+      " readings</p><p><a href=\"status\">status</a></p>");
   });
-  server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) {
     r->send(200, "application/json",
-      "{\"pong\":true,\"heap\":" + String(ESP.getFreeHeap()) +
-      ",\"uptime\":" + String(millis() / 1000) + "}");
+      "{\"temperature\":" + String(temperature, 1) + ",\"readings\":" + String(readings) + "}");
   });
   server.begin();
 
-  tunnelLog(true);
-  tunnelSetup(SELFHOST, TUNNEL_SERVER);   // tunnel now runs on its own core
+  tunnelSetup(SELFHOST, TUNNEL_SERVER);   // from here on the tunnel runs by itself
 }
 
 void loop() {
-  // Main loop is free — the tunnel runs independently.
-  static bool logged = false;
-  if (!logged && tunnelReady()) {
-    logger.info("Tunnel live: %s (%s)", tunnelURL().c_str(), tunnelProviderName());
-    logged = true;
-  }
+  // Your application. It never has to call anything for the tunnel.
+  temperature = 20.0 + 5.0 * sin(millis() / 10000.0);   // stand-in for a real sensor
+  readings = readings + 1;
 
-  // Serial commands
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n'); cmd.trim();
-    if (cmd.length() == 0) return;
-    if (espfetch.check(cmd)) return;
-    if (cmd == "url") logger.info("Tunnel: %s", tunnelURL().c_str());
-    if (cmd == "ip")  logger.info("Last IP: %s", tunnelLastIP().c_str());
+  static bool shown = false;
+  if (!shown && tunnelReady()) {
+    shown = true;
+    String key = tunnelKey();
+    Serial.printf("Public link: %s/%s\n", tunnelURL().c_str(), key.length() ? ("?key=" + key).c_str() : "");
   }
-
-  // Your application logic here — sensors, displays, etc.
-  delay(100);
+  delay(1000);
 }

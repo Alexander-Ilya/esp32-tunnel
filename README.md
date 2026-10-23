@@ -44,8 +44,7 @@ WiFi + TLS (the `https` relay) + your web server, not the tunnel.
 ## Dependencies
 
 Automatically installed:
-- **[espfetch](https://github.com/HamzaYslmn/espfetch)** — neofetch-style system info + ESPLogger
-- **[esp-rtosSerial](https://github.com/HamzaYslmn/esp-rtosSerial)** — thread-safe Serial for FreeRTOS (`#include <rtosSerial.h>`)
+- **[ESP Async WebServer](https://github.com/ESP32Async/ESPAsyncWebServer)** + **AsyncTCP** — the local web server the examples use (not needed in handler mode)
 
 ## Installation
 

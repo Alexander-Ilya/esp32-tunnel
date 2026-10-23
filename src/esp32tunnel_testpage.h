@@ -30,10 +30,10 @@ a{color:#58a6ff;text-decoration:none}
 <a href="https://github.com/HamzaYslmn">by HamzaYslmn</a>
 <div id="ms">---</div>
 <script>
-let b=window.location.pathname.replace(/\/?$/,'/');
-async function p(){try{let t=performance.now();await fetch(b+'ping');
-document.getElementById('ms').textContent=Math.round(performance.now()-t)+' ms'}
-catch(e){document.getElementById('ms').textContent='--'}}
+let b=location.pathname.replace(/\/?$/,'/'),q=location.search;  // keep ?key= for the relay
+async function p(){let m='--';try{let t=performance.now(),r=await fetch(b+'ping'+q);
+if(r.ok)m=Math.round(performance.now()-t)+' ms'}catch(e){}
+document.getElementById('ms').textContent=m}
 p();setInterval(p,5000);
 </script></body></html>
 )rawliteral";

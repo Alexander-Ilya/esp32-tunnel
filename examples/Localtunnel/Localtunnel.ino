@@ -1,78 +1,59 @@
 /*
- * Localtunnel.ino — Free HTTPS URL via localtunnel.me (no server needed)
+ * Localtunnel — free HTTPS link from loca.lt, no relay server of your own.
  *
- * localtunnel provides free, random or named HTTPS subdomains:
+ * The ESP32 asks loca.lt for a subdomain and receives visitors' requests
+ * over plain TCP connections it keeps open:
  *   https://my-esp32.loca.lt
  *
- * No relay server required — the ESP32 connects directly to loca.lt
- * and receives forwarded TCP connections.
+ * If the subdomain is taken, loca.lt hands out a random one instead —
+ * the link actually used is printed to Serial.
  *
- * Modes:
- *   TUN_FLEX   (default) — falls back to random subdomain if taken
- *   TUN_STRICT           — fails if the requested subdomain is taken
+ * Note: loca.lt may show first-time browser visitors its own reminder page.
+ * No access key here — anyone with the link can open it.
  *
- * Public URL:  https://<subdomain>.loca.lt
- *
- * Board: ESP32 or ESP8266
+ * Board: ESP32
  */
 
 #include <ESPAsyncWebServer.h>
 #include <esp32tunnel.h>
 #include <esp32tunnel_testpage.h>
-#include <espfetch.h>
-#include <rtosSerial.h>
 
-// ── Configuration ────────────────────────────────────────────
+// ── Change these ─────────────────────────────────────────────
 const char *WIFI_SSID = "YOUR_SSID";
 const char *WIFI_PASS = "YOUR_PASS";
-
-// Requested subdomain (https://my-esp32.loca.lt)
-const char *SUBDOMAIN = "my-esp32";
+const char *SUBDOMAIN = "my-esp32";          // https://my-esp32.loca.lt
 // ─────────────────────────────────────────────────────────────
 
 AsyncWebServer server(80);
 
 void setup() {
-  rtosSerial.begin(115200);
+  Serial.begin(115200);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  logger.info("Connecting to WiFi...");
   while (WiFi.status() != WL_CONNECTED) delay(500);
-  logger.info("WiFi: %s", WiFi.localIP().toString().c_str());
+  Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
 
-  // Local web server routes (served through the tunnel)
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
     r->send(200, "text/html", TUN_TEST_HTML);
   });
-
   server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "application/json",
-      "{\"pong\":true,\"heap\":" + String(ESP.getFreeHeap()) +
-      ",\"uptime\":" + String(millis() / 1000) + "}");
+    r->send(200, "application/json", "{\"pong\":true}");
   });
-
   server.begin();
 
-  // Start the tunnel — use TUN_STRICT to fail if subdomain is taken
+  tunnelLog();
   tunnelSetup(LOCALTUNNEL, SUBDOMAIN);
 }
 
 void loop() {
-  tunnelLoop(true);
-
-  static bool logged = false;
-  if (!logged && tunnelReady()) {
-    logger.info("Tunnel live: %s (%s)", tunnelURL().c_str(), tunnelProviderName());
-    logged = true;
+  static bool shown = false;
+  if (!shown && tunnelReady()) {
+    shown = true;
+    Serial.printf("Public link: %s\n", tunnelURL().c_str());
   }
 
-  // Serial commands
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n'); cmd.trim();
-    if (cmd.length() == 0) return;
-    if (espfetch.check(cmd)) return;
-    if (cmd == "url") logger.info("Tunnel: %s", tunnelURL().c_str());
-    if (cmd == "ip")  logger.info("Last IP: %s", tunnelLastIP().c_str());
-  }
+  delay(100);
 }
