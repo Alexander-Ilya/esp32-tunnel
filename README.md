@@ -33,6 +33,18 @@ WiFi + TLS (the `https` relay) + your web server, not the tunnel.
 | Relay + local web server + mDNS (typical) | ~1108 KB | — |
 | Handler mode + `#define TUN_MDNS 0` | ~1037 KB | **−71 KB** |
 
+- **Leave out providers you don't use** — `#define` before the include (or `-D` build flags).
+  Measured on the SelfHosted example (1,101,930 B with everything in):
+
+  | Flag | Saves |
+  |---|---|
+  | `TUN_NO_LOCALTUNNEL` | 5.1 KB |
+  | `TUN_NO_OPENPORT` | 3.7 KB |
+  | `TUN_NO_TUNNELMOLE` | 3.0 KB |
+  | `TUN_NO_BORE` | 1.9 KB |
+  | all four (self-hosted only) | **14.5 KB** |
+
+  Self-hosted is always built in. Calling `tunnelSetup()` with a left-out provider does nothing.
 - **Drop the local web server** — use handler mode (`tunnelSetup(SELFHOST, handler, "host/id")`); no `ESPAsyncWebServer`, saves its flash **and** its runtime `AsyncTCP` task/buffers.
 - **`#define TUN_MDNS 0`** before the include — drops mDNS (~30 KB) if you don't need `<id>.local`.
 - **`#define TUN_TASK_STACK 6144`** — trims the background-task stack (RAM). Keep ≥8 KB if your relay is `https` (TLS needs the headroom).

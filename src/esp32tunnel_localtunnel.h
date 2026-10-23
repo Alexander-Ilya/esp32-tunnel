@@ -19,17 +19,6 @@ static unsigned long _poolAge[TUN_POOL];
 static unsigned long _poolAliveCheck[TUN_POOL];
 static WiFiClient    _ltLocal;
 
-// TLS only for the loca.lt allocation API
-
-static bool _tlsConnect(WiFiClientSecure &tls, const char *host, uint16_t port) {
-  tls.setInsecure();
-#ifdef ESP32
-  return tls.connect(host, port, _CONNECT_MS);
-#else
-  tls.setTimeout(_CONNECT_MS);
-  return tls.connect(host, port);
-#endif
-}
 
 // MARK: Connection pool
 

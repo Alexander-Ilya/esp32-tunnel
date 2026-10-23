@@ -13,7 +13,8 @@
  *   tunnelSetup(TUNNELMOLE);                          // https://<random>.tunnelmole.net
  *
  * Handler-mode assets: #include <esp32tunnel_progmem.h> or <esp32tunnel_littlefs.h>
- * Tuning (before the include): TUN_MAX_BODY, TUN_TASK_PRIO, TUN_TASK_STACK, TUN_MDNS
+ * Tuning (before the include): TUN_MAX_BODY, TUN_TASK_PRIO, TUN_TASK_STACK, TUN_MDNS,
+ *   TUN_NO_LOCALTUNNEL, TUN_NO_BORE, TUN_NO_OPENPORT, TUN_NO_TUNNELMOLE (leave providers out)
  */
 
 #ifndef ESP32TUNNEL_H
@@ -177,6 +178,17 @@ static bool _tcpConnectHost(WiFiClient &c, const char *host, uint16_t port) {
 #else
   c.setTimeout(_CONNECT_MS);
   return c.connect(host, port);
+#endif
+}
+
+// TLS without certificate checks — for provider APIs (loca.lt, openport.pw).
+static bool _tlsConnect(WiFiClientSecure &tls, const char *host, uint16_t port) {
+  tls.setInsecure();
+#ifdef ESP32
+  return tls.connect(host, port, _CONNECT_MS);
+#else
+  tls.setTimeout(_CONNECT_MS);
+  return tls.connect(host, port);
 #endif
 }
 
@@ -425,19 +437,55 @@ static void _tunStep(_TunBase &t, unsigned long base, unsigned long cap,
 
 // MARK: Providers
 
+// Leave unused providers out of the build (before the include, or as -D flags):
+//   TUN_NO_LOCALTUNNEL  TUN_NO_BORE  TUN_NO_OPENPORT  TUN_NO_TUNNELMOLE
+// Self-hosted is always in (TUNNELMOLE rides on it). A left-out provider does nothing.
+#ifdef TUN_NO_LOCALTUNNEL
+#define _TUN_LT 0
+#else
+#define _TUN_LT 1
+#endif
+#ifdef TUN_NO_BORE
+#define _TUN_BORE 0
+#else
+#define _TUN_BORE 1
+#endif
+#if defined(ESP32) && !defined(TUN_NO_OPENPORT)
+#define _TUN_OP 1
+#else
+#define _TUN_OP 0
+#endif
+#if defined(ESP32) && !defined(TUN_NO_TUNNELMOLE)
+#define _TUN_TM 1
+#else
+#define _TUN_TM 0
+#endif
+
 #include "esp32tunnel_selfhosted.h"
+#if _TUN_LT
 #include "esp32tunnel_localtunnel.h"
+#endif
+#if _TUN_BORE
 #include "esp32tunnel_bore.h"
-#include "esp32tunnel_openport.h"     // ESP32 only
-#include "esp32tunnel_tunnelmole.h"   // ESP32 only
+#endif
+#if _TUN_OP
+#include "esp32tunnel_openport.h"
+#endif
+#if _TUN_TM
+#include "esp32tunnel_tunnelmole.h"
+#endif
 
 static TunnelProvider _tunProvider = SELFHOST;
 
 static _TunBase &_tunCur() {
   switch (_tunProvider) {
+#if _TUN_LT
     case LOCALTUNNEL: return _lt;
+#endif
+#if _TUN_BORE
     case BORE:        return _bore;
-#ifdef ESP32
+#endif
+#if _TUN_OP
     case OPENPORT:    return _op;
 #endif
     default:          return _sh;     // SELFHOST, TUNNELMOLE (same WebSocket session)
@@ -449,10 +497,16 @@ static _TunBase &_tunCur() {
 static inline void _tunService() {
   switch (_tunProvider) {
     case SELFHOST:    _shLoop(); break;
+#if _TUN_LT
     case LOCALTUNNEL: _ltLoop(); break;
+#endif
+#if _TUN_BORE
     case BORE:        _boreLoop(); break;
-#ifdef ESP32
+#endif
+#if _TUN_OP
     case OPENPORT:    _opLoop(); break;
+#endif
+#if _TUN_TM
     case TUNNELMOLE:  _tmLoop(); break;
 #endif
     default: break;
@@ -490,10 +544,16 @@ inline void tunnelSetup(TunnelProvider p, TunnelHandler handler,
     _tunKey = _tunMakeKey();
   switch (p) {
     case SELFHOST:    _shBegin(handler, option); break;
+#if _TUN_LT
     case LOCALTUNNEL: _ltBegin(handler, option, mode); break;
+#endif
+#if _TUN_BORE
     case BORE:        _boreBegin(option, TUN_PORT); break;     // raw TCP: needs a web server
-#ifdef ESP32
+#endif
+#if _TUN_OP
     case OPENPORT:    _opBegin(); break;                       // raw TCP: needs a web server
+#endif
+#if _TUN_TM
     case TUNNELMOLE:  _tmBegin(handler); break;
 #endif
     default: break;
@@ -559,9 +619,13 @@ inline void tunnelStop() {
   }
 #endif
   switch (_tunProvider) {
+#if _TUN_LT
     case LOCALTUNNEL: _ltStop(); break;
+#endif
+#if _TUN_BORE
     case BORE:        _boreStop(); break;
-#ifdef ESP32
+#endif
+#if _TUN_OP
     case OPENPORT:    _opStop(); break;
 #endif
     default:          _shStop(); break;   // SELFHOST, TUNNELMOLE
