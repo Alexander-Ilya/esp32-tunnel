@@ -24,8 +24,6 @@ def get(devid, key=None, where="query"):
     req = urllib.request.Request(url)
     if key and where == "query":
         req.full_url = f"{url}?key={key}"
-    elif key and where == "xquery":
-        req.full_url = f"{url}?x-tunnel-key={key}"
     elif key and where == "header":
         req.add_header("X-Tunnel-Key", key)
     try:
@@ -35,9 +33,9 @@ def get(devid, key=None, where="query"):
         return e.code
 
 
-def fetch(path, data=None):
+def fetch(path, data=None, headers={}):
     try:
-        with urllib.request.urlopen(urllib.request.Request(BASE + path, data=data), timeout=10) as r:
+        with urllib.request.urlopen(urllib.request.Request(BASE + path, data=data, headers=headers), timeout=10) as r:
             return r.status, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, ""
@@ -56,18 +54,23 @@ async def main():
         await asyncio.sleep(0.4)
         ok("no key -> 401",            await g("secdev"), 401)
         ok("?key= -> 200",             await g("secdev", "s3cret", "query"), 200)
-        ok("?x-tunnel-key= -> 200",    await g("secdev", "s3cret", "xquery"), 200)
         ok("header -> 200",            await g("secdev", "s3cret", "header"), 200)
         ok("wrong key -> 401",         await g("secdev", "nope", "query"), 401)
+        ok("POST + header -> 200",     (await f("/secdev/echo", b"hi", {"X-Tunnel-Key": "s3cret"}))[0], 200)
+        ok("POST + ?key= -> 200",      (await f("/secdev/echo?key=s3cret", b"hi"))[0], 200)
+        ok("POST, no key -> 401",      (await f("/secdev/echo", b"hi"))[0], 401)
         two = await asyncio.gather(g("secdev", "s3cret"), g("secdev", "s3cret"))
         ok("2 clients -> 200/200",     tuple(two), (200, 200))
-        try:                            # hijack: same id, wrong token
-            import websockets
-            async with websockets.connect("ws://127.0.0.1:8011/api/tunnel/ws?id=secdev&token=WRONG") as w:
-                await w.recv(); hij = "not-closed"
-        except Exception:
-            hij = "rejected"
-        ok("hijack -> rejected", hij, "rejected")
+        import websockets
+        for name, url, hdrs in (("hijack -> rejected", "", {"X-Tunnel-Key": "WRONG"}),
+                                ("old firmware -> rejected", "&token=s3cret", None)):
+            try:                        # same id, wrong key
+                async with websockets.connect(f"ws://127.0.0.1:8011/api/tunnel/ws?id=secdev{url}",
+                                              additional_headers=hdrs) as w:
+                    await w.recv(); hij = "not-closed"
+            except Exception:
+                hij = "rejected"
+            ok(name, hij, "rejected")
 
     # ── public device ──
     async with FakeESP32(f"ws://127.0.0.1:8011", "pubdev", ""):

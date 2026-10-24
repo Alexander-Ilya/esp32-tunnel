@@ -28,17 +28,19 @@ class FakeESP32:
         return 200, f"{method} {path}", "text/plain"
 
     async def _serve(self, ws):
-        async for raw in ws:
-            m = json.loads(raw)
+        while True:
+            try:
+                m = json.loads(await asyncio.wait_for(ws.recv(), 20))
+            except TimeoutError:                     # like the firmware: the relay drops silent devices
+                await ws.send('{"type":"ping"}')
+                continue
             if m.get("method"):
                 status, body, ctype = self.handler(m["method"], m.get("path", "/"), m.get("body", ""))
                 await ws.send(json.dumps({"id": m["id"], "status": status, "body": body, "type": ctype}))
 
     async def __aenter__(self):
-        url = f"{self.server}/api/tunnel/ws?id={self.id}"
-        if self.key:
-            url += f"&token={self.key}"
-        self._ws = await websockets.connect(url)
+        self._ws = await websockets.connect(f"{self.server}/api/tunnel/ws?id={self.id}",
+                                            additional_headers={"X-Tunnel-Key": self.key} if self.key else None)
         self._task = asyncio.create_task(self._serve(self._ws))
         return self
 

@@ -180,15 +180,15 @@ static void _shParseOption(String s) {
   _sh.shPort = colon < 0 ? (_sh.useTLS ? 443 : 80) : hostPort.substring(colon + 1).toInt();
 }
 
-static bool _shConnect(const String &path) {
+static bool _shConnect(const String &path, const String &hdrs = "") {
   if (_sh.useTLS && !_shWsTLS) { _shWsTLS = new WiFiClientSecure(); _shWsTLS->setInsecure(); }
   _sh.ws = _sh.useTLS ? _shWsTLS : &_shWsPlain;
   if (!_tcpConnectHost(*_sh.ws, _sh.host.c_str(), _sh.shPort)) return false;
   String host = _sh.host;
   if (_sh.shPort != (_sh.useTLS ? 443 : 80)) host += ":" + String(_sh.shPort);
   _sh.ws->printf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-                 path.c_str(), host.c_str());
+                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n",
+                 path.c_str(), host.c_str(), hdrs.c_str());
   char line[128];
   _readLineBuf(*_sh.ws, line, sizeof line, _CONNECT_MS);
   if (!strstr(line, " 101")) { _sh.ws->stop(); return false; }
@@ -209,10 +209,10 @@ static bool _shInit() {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     for (unsigned long t0 = millis(); time(nullptr) < 100000 && millis() - t0 < 5000;) _DELAY(100);
   }
-  // The key rides on the handshake so the relay can reject id hijacks.
+  // The key rides on the handshake (a header, so it stays out of access logs)
+  // so the relay can reject id hijacks.
   String q = String(TUN_WS_PATH) + "?id=" + _sh.id + "&max=" + String(_MAX_BODY_SIZE);
-  if (_tunKey.length()) q += "&token=" + _tunKey;
-  if (!_shConnect(q)) return false;
+  if (!_shConnect(q, _tunKey.length() ? "X-Tunnel-Key: " + _tunKey + "\r\n" : "")) return false;
 
   if (_tunRouteCount > 0) {             // per-route passwords, sent once
     String cfg = "{\"type\":\"config\",\"routes\":[";

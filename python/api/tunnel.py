@@ -2,7 +2,7 @@
 """
 ESP32 connects via WebSocket, visitors access via HTTP proxy.
 
-  WS   /api/tunnel/ws?id=<device>   — ESP32 connects here
+  WS   /api/tunnel/ws?id=<device>   — ESP32 connects here (key in X-Tunnel-Key)
   ANY  /<device>/<path>?<query>     — Visitors reach ESP32 here
 """
 
@@ -30,7 +30,6 @@ DEFAULT_MAX = 16384            # device's TUN_MAX_BODY when it doesn't announce 
 MAX_REPLY_LEN = 4 * 1024 * 1024   # largest device reply we parse (body is JSON-escaped)
 _VALID_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _FORWARD_HEADERS = ("authorization", "cookie", "user-agent", "accept", "accept-language")
-_KEY_PARAMS = ("key", "x-tunnel-key")
 
 
 # MARK: Tunnel — isolates per-connection state
@@ -72,7 +71,7 @@ def _device_target(request: Request) -> str:
     if ".." in unquote(path) or "\x00" in unquote(path):
         raise HTTPException(400, "Bad path")
     query = "&".join(p for p in request.url.query.split("&")
-                     if p and p.split("=", 1)[0] not in _KEY_PARAMS)
+                     if p and p.split("=", 1)[0] != "key")
     target = f"{path}?{query}" if query else path
     if len(target) > MAX_PATH_LEN:
         raise HTTPException(414, "URI too long")
@@ -89,11 +88,11 @@ def _clean_grace():
     _grace = {k: v for k, v in _grace.items() if v > cutoff}
 
 
-# MARK: Auth — device key via ?key= or X-Tunnel-Key. No key on device = no check.
+# MARK: Auth — device key via X-Tunnel-Key or ?key=, any method. No key on device = no check.
+# ponytail: no cookie on purpose — every device shares the relay's origin, so another
+# device's page could fetch() this one with the visitor's cookie attached.
 def _req_key(request: Request) -> str:
-    return (request.query_params.get("key")
-            or request.query_params.get("x-tunnel-key")
-            or request.headers.get("x-tunnel-key", ""))
+    return request.headers.get("x-tunnel-key") or request.query_params.get("key", "")
 
 
 def _authorize(tun: Tunnel, request: Request):
@@ -103,9 +102,13 @@ def _authorize(tun: Tunnel, request: Request):
 
 # MARK: WebSocket endpoint — ESP32 connects here
 @router.websocket("/tunnel/ws")
-async def tunnel_ws(ws: WebSocket, id: str, token: str = "", max: int = DEFAULT_MAX):
+async def tunnel_ws(ws: WebSocket, id: str, max: int = DEFAULT_MAX):
+    token = ws.headers.get("x-tunnel-key", "")   # a header, not the URL: URLs land in access logs
     if not _VALID_ID.match(id):
         await ws.close(4000, "invalid id")
+        return
+    if "token" in ws.query_params:   # firmware < 5.4: refuse rather than serve it without its key
+        await ws.close(4002, "update esp32-tunnel to 5.4+")
         return
 
     await ws.accept()
@@ -129,17 +132,15 @@ async def tunnel_ws(ws: WebSocket, id: str, token: str = "", max: int = DEFAULT_
     _grace.pop(id, None)
     log.info(f"[tunnel] + {id} ({len(tunnels)} active)")
 
-    beats = False   # firmware >= 5.3.2 sends {"type":"ping"} every 20 s; older never does
     try:
         while True:
-            raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT if beats else None)
+            raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT)
             if len(raw) > MAX_REPLY_LEN:
                 continue
             msg = json.loads(raw)
 
             # Render's proxy answers WS pings itself, so only app data proves the device is alive.
             if msg.get("type") == "ping":
-                beats = True
                 await ws.send_text('{"type":"pong"}')
                 continue
 
