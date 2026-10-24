@@ -24,6 +24,7 @@ router = APIRouter(tags=["Tunnel"])
 # MARK: Config
 TIMEOUT = 30
 GRACE_PERIOD = 15
+HEARTBEAT = 60                 # drop a device silent this long (it pings every 20 s)
 MAX_PATH_LEN = 2048
 DEFAULT_MAX = 16384            # device's TUN_MAX_BODY when it doesn't announce one (&max=)
 MAX_REPLY_LEN = 4 * 1024 * 1024   # largest device reply we parse (body is JSON-escaped)
@@ -128,12 +129,19 @@ async def tunnel_ws(ws: WebSocket, id: str, token: str = "", max: int = DEFAULT_
     _grace.pop(id, None)
     log.info(f"[tunnel] + {id} ({len(tunnels)} active)")
 
+    beats = False   # firmware >= 5.3.2 sends {"type":"ping"} every 20 s; older never does
     try:
         while True:
-            raw = await ws.receive_text()
+            raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT if beats else None)
             if len(raw) > MAX_REPLY_LEN:
                 continue
             msg = json.loads(raw)
+
+            # Render's proxy answers WS pings itself, so only app data proves the device is alive.
+            if msg.get("type") == "ping":
+                beats = True
+                await ws.send_text('{"type":"pong"}')
+                continue
 
             # Route config: accepted once, then locked
             if msg.get("type") == "config":

@@ -252,7 +252,17 @@ static bool _wsServe(void (*onText)(const String &)) {
   return true;
 }
 
-static bool _shServe() { return _wsServe(_shRequest); }
+// Text heartbeat: proxies like Render's answer WS pings themselves, so the relay
+// only notices a dead device when these stop.
+static bool _shServe() {
+  static unsigned long beat;
+  if (millis() - beat > 20000) {
+    beat = millis();
+    static const char hb[] = "{\"type\":\"ping\"}";
+    if (!(_shFrame(0x1, sizeof hb - 1) && _shSend((const uint8_t *)hb, sizeof hb - 1))) return false;
+  }
+  return _wsServe(_shRequest);
+}
 
 // MARK: Internal API (dispatched from esp32tunnel.h)
 
