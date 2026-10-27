@@ -134,7 +134,7 @@ async def tunnel_ws(ws: WebSocket, id: str, max: int = DEFAULT_MAX):
 
     try:
         while True:
-                       raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT)
+            raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT)
             if len(raw) > MAX_REPLY_LEN:
                 continue
             msg = json.loads(raw)
