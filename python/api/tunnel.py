@@ -134,7 +134,19 @@ async def tunnel_ws(ws: WebSocket, id: str, max: int = DEFAULT_MAX):
 
     try:
         while True:
-            raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT)
+            # Собираем фреймы, пока не получим валидный UTF-8
+            raw_bytes = b""
+            while True:
+                message = await asyncio.wait_for(ws.receive(), HEARTBEAT)
+                if message["type"] == "websocket.disconnect":
+                    raise Exception("disconnect")
+                raw_bytes += message.get("bytes", b"") or message.get("text", "").encode("utf-8")
+                try:
+                    raw = raw_bytes.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    continue  # Ждём следующий фрейм
+
             if len(raw) > MAX_REPLY_LEN:
                 continue
             msg = json.loads(raw)
