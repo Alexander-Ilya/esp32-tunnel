@@ -26,7 +26,7 @@ TIMEOUT = 30
 GRACE_PERIOD = 15
 HEARTBEAT = 60                 # drop a device silent this long (it pings every 20 s)
 MAX_PATH_LEN = 2048
-DEFAULT_MAX = 16384            # device's TUN_MAX_BODY when it doesn't announce one (&max=)
+DEFAULT_MAX = 65536            # device's TUN_MAX_BODY when it doesn't announce one (&max=)
 MAX_REPLY_LEN = 4 * 1024 * 1024   # largest device reply we parse (body is JSON-escaped)
 _VALID_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _FORWARD_HEADERS = ("authorization", "cookie", "user-agent", "accept", "accept-language")
